@@ -1,0 +1,149 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      # ── Solution00 (Solution01 folder — .NET 9, self-contained win-x64) ─────────
+
+      - name: Restore Solution00 packages
+        run: dotnet restore Solution01/FoundryQA.csproj
+
+      - name: Publish Solution00 (self-contained win-x64)
+        run: >
+          dotnet publish Solution01/FoundryQA.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -o publish/Solution00
+
+      - name: Zip Solution00
+        shell: pwsh
+        run: Compress-Archive -Path publish/Solution00/* -DestinationPath Solution00.zip
+
+      # ── Solution01 (Solution02 folder — .NET Framework 4.8, win-x64) ───────────
+
+      - name: Restore Solution01 packages
+        run: dotnet restore Solution02/FoundryChatApp.csproj
+
+      - name: Publish Solution01 (.NET Framework 4.8, win-x64)
+        run: >
+          dotnet publish Solution02/FoundryChatApp.csproj
+          -c Release
+          -o publish/Solution01
+
+      - name: Zip Solution01
+        shell: pwsh
+        run: Compress-Archive -Path publish/Solution01/* -DestinationPath Solution01.zip
+
+      # ── Determine release tag ────────────────────────────────────────────────────
+
+      - name: Determine release tag
+        id: release_tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $tag = '${{ github.event.inputs.version }}'
+          } else {
+            $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
+          }
+          "value=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create or force-push tag (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.release_tag.outputs.value }} --force
+          git push origin ${{ steps.release_tag.outputs.value }} --force
+
+      # ── Create GitHub Release ────────────────────────────────────────────────────
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.value }}
+          name: "Release ${{ steps.release_tag.outputs.value }}"
+          body: |
+            ## Foundry Local AI Chat Apps — ${{ steps.release_tag.outputs.value }}
+
+            Two Windows WinForms chat applications using **Azure AI Foundry Local** for fully on-device LLM inference.
+            No cloud connection required — models download and run entirely on your machine.
+
+            ---
+
+            ### 📦 Solution00 — .NET 9 Chat App (Self-Contained)
+
+            **⬇ Download: `Solution00.zip`**
+
+            - Built with .NET 9 WinForms — **no .NET runtime installation needed** (self-contained)
+            - Model picker with hardware-aware fit indicators (RAM, GPU)
+            - Streaming chat responses with multi-turn conversation history
+            - WinML hardware acceleration support
+
+            **System Requirements:**
+            | Requirement | Details |
+            |---|---|
+            | OS | Windows 10 version 1903 (build 18362) or later |
+            | Runtime | Bundled — no installation needed |
+            | VC++ Redistributable | **Required** — [⬇ Download Visual C++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+
+            > ⚠ The app will warn you at startup if the VC++ Redistributable is missing.
+
+            ---
+
+            ### 📦 Solution01 — .NET Framework 4.8 Chat App
+
+            **⬇ Download: `Solution01.zip`**
+
+            - Built with .NET Framework 4.8 WinForms
+            - Hardware info panel (CPU, RAM, GPU, EPs)
+            - Model catalog with size/memory indicators
+            - One-click download & load of any available model
+
+            **System Requirements:**
+            | Requirement | Details |
+            |---|---|
+            | OS | Windows 10 version 1803 or later |
+            | .NET Framework 4.8 | Pre-installed on Windows 10 1803+ — [⬇ Download if needed](https://dotnet.microsoft.com/en-us/download/dotnet-framework/net48) |
+            | VC++ Redistributable | **Required** — [⬇ Download Visual C++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+
+            > ⚠ The app will warn you at startup if the VC++ Redistributable is missing.
+
+            ---
+
+            ### 🚀 Quick Start
+
+            1. Download and unzip the preferred solution above
+            2. Install any missing prerequisites listed (the app will prompt you if needed)
+            3. Run the `.exe` inside the unzipped folder
+            4. The app connects to Foundry Local automatically, fetches the model catalog, and lets you download and chat with any available model — no cloud required
+          files: |
+            Solution00.zip
+            Solution01.zip
+          draft: false
+          prerelease: false
