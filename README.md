@@ -20,7 +20,8 @@ This repository contains two generated solutions:
 
 ```text
 Solution01/   — .NET 9 WinForms app (self-contained, win-x64)
-Solution02/   — .NET Framework 4.8 WinForms app (win-x64)
+Solution02/   — .NET Framework 4.8 WinForms chat app (win-x64)
+Solution03/   — .NET Framework 4.8 WinForms Voice-to-Text app (win-x64)
 ```
 
 ### Solution01
@@ -38,6 +39,15 @@ It represents the initial version of the application and was used as a baseline 
 The application was developed iteratively using prompts entered during the session.
 
 ![Solution02 Screenshot](Solution01.jpg)
+
+### Solution03
+
+`Solution03` is a Voice-to-Text application generated using GitHub Copilot CLI.
+
+- **Windows Speech Recognition** (built-in, near-realtime): shows hypothesis words in gray as you speak, confirms them in white when recognised
+- **Foundry Local Whisper models** (if available in catalog): select a transcription model, download it, and use it for higher-accuracy chunk-based transcription
+- Microphone device selector — choose which input device to use
+- Live scrolling transcript panel
 
 ## Prompt History
 
@@ -74,8 +84,9 @@ Pre-built ZIP files are attached to every [GitHub Release](https://github.com/Ma
 
 | Release zip      | Description                                    | Requirements                                  |
 | ---------------- | ---------------------------------------------- | --------------------------------------------- |
-| `Solution01.zip` | .NET 9 WinForms app, self-contained win-x64    | Windows 10 1903+, [VC++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
-| `Solution02.zip` | .NET Framework 4.8 WinForms app, win-x64       | Windows 10 1803+, [VC++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+| `Solution01.zip` | .NET 9 WinForms chat app, self-contained win-x64 | Windows 10 1903+, [VC++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+| `Solution02.zip` | .NET Framework 4.8 WinForms chat app, win-x64  | Windows 10 1803+, [VC++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+| `Solution03.zip` | .NET Framework 4.8 WinForms Voice-to-Text, win-x64 | Windows 10 1803+, [VC++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
 
 ### How to run after downloading
 

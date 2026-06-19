@@ -61,6 +61,21 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path publish/Solution02/* -DestinationPath Solution02.zip
 
+      # ── Solution03 (Solution03 folder — .NET Framework 4.8, Voice-to-Text) ─────
+
+      - name: Restore Solution03 packages
+        run: dotnet restore Solution03/FoundrySTT.csproj
+
+      - name: Publish Solution03 (.NET Framework 4.8, win-x64)
+        run: >
+          dotnet publish Solution03/FoundrySTT.csproj
+          -c Release
+          -o publish/Solution03
+
+      - name: Zip Solution03
+        shell: pwsh
+        run: Compress-Archive -Path publish/Solution03/* -DestinationPath Solution03.zip
+
       # ── Determine release tag ────────────────────────────────────────────────────
 
       - name: Determine release tag
@@ -137,9 +152,28 @@ jobs:
 
             > ⚠ The app will warn you at startup if the VC++ Redistributable is missing.
 
+            ### 📦 Solution03 — .NET Framework 4.8 Voice-to-Text App
+
+            **⬇ Download: `Solution03.zip`**
+
+            - Built with .NET Framework 4.8 WinForms
+            - **Windows Speech Recognition** (built-in, near-realtime word-by-word)
+            - **Foundry Local Whisper models** — if transcription models are in the catalog, select them for higher accuracy (chunk-based)
+            - Microphone device selector
+            - Live transcript display with interim (gray) and confirmed (white) text
+
+            **System Requirements:**
+            | Requirement | Details |
+            |---|---|
+            | OS | Windows 10 version 1803 or later |
+            | .NET Framework 4.8 | Pre-installed on Windows 10 1803+ — [⬇ Download if needed](https://dotnet.microsoft.com/en-us/download/dotnet-framework/net48) |
+            | VC++ Redistributable | **Required** — [⬇ Download Visual C++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+
+            > ⚠ The app will warn you at startup if the VC++ Redistributable is missing.
+
             ---
 
-            ### 🚀 How to run
+
 
             1. Download and unzip the preferred solution above
             2. **Right-click the `.exe` → Properties → check Unblock → OK** (removes Windows download block)
@@ -150,5 +184,6 @@ jobs:
           files: |
             Solution01.zip
             Solution02.zip
+            Solution03.zip
           draft: false
           prerelease: false
