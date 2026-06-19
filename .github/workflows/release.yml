@@ -29,37 +29,37 @@ jobs:
         with:
           dotnet-version: '9.0.x'
 
-      # ── Solution00 (Solution01 folder — .NET 9, self-contained win-x64) ─────────
+      # ── Solution01 (Solution01 folder — .NET 9, self-contained win-x64) ─────────
 
-      - name: Restore Solution00 packages
+      - name: Restore Solution01 packages
         run: dotnet restore Solution01/FoundryQA.csproj
 
-      - name: Publish Solution00 (self-contained win-x64)
+      - name: Publish Solution01 (self-contained win-x64)
         run: >
           dotnet publish Solution01/FoundryQA.csproj
           -c Release
           -r win-x64
           --self-contained true
-          -o publish/Solution00
-
-      - name: Zip Solution00
-        shell: pwsh
-        run: Compress-Archive -Path publish/Solution00/* -DestinationPath Solution00.zip
-
-      # ── Solution01 (Solution02 folder — .NET Framework 4.8, win-x64) ───────────
-
-      - name: Restore Solution01 packages
-        run: dotnet restore Solution02/FoundryChatApp.csproj
-
-      - name: Publish Solution01 (.NET Framework 4.8, win-x64)
-        run: >
-          dotnet publish Solution02/FoundryChatApp.csproj
-          -c Release
           -o publish/Solution01
 
       - name: Zip Solution01
         shell: pwsh
         run: Compress-Archive -Path publish/Solution01/* -DestinationPath Solution01.zip
+
+      # ── Solution02 (Solution02 folder — .NET Framework 4.8, win-x64) ───────────
+
+      - name: Restore Solution02 packages
+        run: dotnet restore Solution02/FoundryChatApp.csproj
+
+      - name: Publish Solution02 (.NET Framework 4.8, win-x64)
+        run: >
+          dotnet publish Solution02/FoundryChatApp.csproj
+          -c Release
+          -o publish/Solution02
+
+      - name: Zip Solution02
+        shell: pwsh
+        run: Compress-Archive -Path publish/Solution02/* -DestinationPath Solution02.zip
 
       # ── Determine release tag ────────────────────────────────────────────────────
 
@@ -100,14 +100,13 @@ jobs:
 
             ---
 
-            ### 📦 Solution00 — .NET 9 Chat App (Self-Contained)
+            ### 📦 Solution01 — .NET 9 Chat App (Self-Contained)
 
-            **⬇ Download: `Solution00.zip`**
+            **⬇ Download: `Solution01.zip`**
 
             - Built with .NET 9 WinForms — **no .NET runtime installation needed** (self-contained)
             - Model picker with hardware-aware fit indicators (RAM, GPU)
             - Streaming chat responses with multi-turn conversation history
-            - WinML hardware acceleration support
 
             **System Requirements:**
             | Requirement | Details |
@@ -120,9 +119,9 @@ jobs:
 
             ---
 
-            ### 📦 Solution01 — .NET Framework 4.8 Chat App
+            ### 📦 Solution02 — .NET Framework 4.8 Chat App
 
-            **⬇ Download: `Solution01.zip`**
+            **⬇ Download: `Solution02.zip`**
 
             - Built with .NET Framework 4.8 WinForms
             - Hardware info panel (CPU, RAM, GPU, EPs)
@@ -140,14 +139,16 @@ jobs:
 
             ---
 
-            ### 🚀 Quick Start
+            ### 🚀 How to run
 
             1. Download and unzip the preferred solution above
-            2. Install any missing prerequisites listed (the app will prompt you if needed)
-            3. Run the `.exe` inside the unzipped folder
-            4. The app connects to Foundry Local automatically, fetches the model catalog, and lets you download and chat with any available model — no cloud required
+            2. **Right-click the `.exe` → Properties → check Unblock → OK** (removes Windows download block)
+            3. If Windows SmartScreen appears, click **More info → Run anyway**
+            4. Install any missing prerequisites listed (the app will prompt you if needed)
+            5. The app connects to Foundry Local automatically — **wait a few seconds** for the model list to load
+            6. Select a model, click **Download & Load**, and start chatting — no cloud required
           files: |
-            Solution00.zip
             Solution01.zip
+            Solution02.zip
           draft: false
           prerelease: false

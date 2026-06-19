@@ -44,11 +44,9 @@ public partial class ModelSelectForm : Form
         SetStatus("Initialising Foundry Local SDK…");
         try
         {
-            var config = new Configuration { AppName = "FoundryQA", LogLevel = Microsoft.AI.Foundry.Local.LogLevel.Warning };
+            var config = new Configuration { AppName = "FoundryQA" };
             await FoundryLocalManager.CreateAsync(config, NullLogger.Instance);
             _manager = FoundryLocalManager.Instance;
-
-            await _manager.DownloadAndRegisterEpsAsync(null);
 
             SetStatus("Fetching model catalog…");
             var catalog = await _manager.GetCatalogAsync();
