@@ -4,9 +4,8 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Management;
-using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Speech.Recognition;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.AI.Foundry.Local;
@@ -33,7 +32,6 @@ namespace FoundrySTT
         // ── State ─────────────────────────────────────────────────────────────────
         private List<IModel>          _transcriptionModels = new List<IModel>();
         private IModel?               _activeModel;
-        private string?               _foundryEndpoint;
         private bool                  _isRecording;
         private bool                  _busy;
 
@@ -41,13 +39,12 @@ namespace FoundrySTT
         private SpeechRecognitionEngine? _sre;
         private int                   _interimStart = -1;
 
-        // ── NAudio / Whisper ──────────────────────────────────────────────────────
-        private WaveInEvent?          _waveIn;
-        private MemoryStream?         _audioBuffer;
-        private WaveFileWriter?       _waveWriter;
-        private System.Windows.Forms.Timer? _whisperTimer;
-        private bool                  _sendingChunk;
-        private readonly HttpClient   _http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        // ── NAudio / Foundry Whisper (SDK native, no HTTP) ────────────────────────
+        private WaveInEvent?                  _waveIn;
+        private OpenAIAudioClient?            _audioClient;
+        private LiveAudioTranscriptionSession? _liveSession;
+        private Task?                         _liveStreamTask;
+        private CancellationTokenSource?      _liveCts;
 
         // ── Colour palette ────────────────────────────────────────────────────────
         private static readonly Color BgDark    = Rgb(32,  33,  35);
@@ -370,19 +367,18 @@ namespace FoundrySTT
                 Status($"⏳  Loading {item.Model.Alias} into memory…");
                 await item.Model.LoadAsync();
 
-                // Try to discover the Foundry Local HTTP endpoint for the audio API
-                _foundryEndpoint = await TryGetFoundryEndpointAsync(item.Model);
+                // Get the SDK-native audio client — no HTTP endpoint needed
+                _audioClient = await item.Model.GetAudioClientAsync();
+                _audioClient.Settings.Language = "en";
 
                 _activeModel = item.Model;
 
                 SafeUI(() =>
                 {
-                    _btnLoad.Text      = "✅  Loaded";
-                    _btnLoad.Enabled   = false;
-                    _btnRecord.Enabled = true;
-                    _lblEngineInfo.Text = _foundryEndpoint != null
-                        ? $"  ✓ Loaded • endpoint: {_foundryEndpoint}"
-                        : "  ✓ Loaded • endpoint will be probed on first chunk";
+                    _btnLoad.Text       = "✅  Loaded";
+                    _btnLoad.Enabled    = false;
+                    _btnRecord.Enabled  = true;
+                    _lblEngineInfo.Text = $"  ✓ Loaded  •  SDK native in-process inference";
                 });
 
                 Status($"✅  {item.Model.Alias} ready — press Record to start");
@@ -399,91 +395,11 @@ namespace FoundrySTT
             }
         }
 
-        // Find the Foundry Local HTTP base URL (needed for /v1/audio/transcriptions)
-        private async Task<string?> TryGetFoundryEndpointAsync(IModel _)
-        {
-            // NOTE: do NOT call model.GetChatClientAsync() here — Whisper models are
-            // not chat models and that call will throw or return an incompatible client.
-
-            var bindAll = System.Reflection.BindingFlags.Public
-                        | System.Reflection.BindingFlags.NonPublic
-                        | System.Reflection.BindingFlags.Instance;
-
-            // Approach 1: reflect on FoundryLocalManager.Instance directly
-            try
-            {
-                var mgr  = FoundryLocalManager.Instance;
-                var type = mgr.GetType();
-
-                // Check public + private properties
-                foreach (var name in new[] {
-                    "ServiceUri", "Endpoint", "BaseAddress", "ServiceUrl",
-                    "BaseUrl", "Uri", "LocalEndpoint", "ServerUri" })
-                {
-                    var prop = type.GetProperty(name, bindAll);
-                    if (prop == null) continue;
-                    var val = prop.GetValue(mgr);
-                    if (val is Uri u)  return u.ToString().TrimEnd('/');
-                    if (val is string s && s.StartsWith("http")) return s.TrimEnd('/');
-                }
-
-                // Check fields (SDK often stores state in private fields)
-                foreach (var field in type.GetFields(bindAll))
-                {
-                    var val = field.GetValue(mgr);
-                    if (val is Uri u && u.IsAbsoluteUri)
-                        return u.ToString().TrimEnd('/');
-                    if (val is string s &&
-                        (s.StartsWith("http://localhost") ||
-                         s.StartsWith("http://127.0.0.1")))
-                        return s.TrimEnd('/');
-                }
-
-                // Recurse one level into nested objects (e.g. mgr._server.Endpoint)
-                foreach (var field in type.GetFields(bindAll))
-                {
-                    var nested = field.GetValue(mgr);
-                    if (nested == null || nested.GetType().IsPrimitive) continue;
-                    var ntype = nested.GetType();
-                    foreach (var name in new[] {
-                        "ServiceUri", "Endpoint", "BaseAddress", "Uri", "Address" })
-                    {
-                        var prop = ntype.GetProperty(name, bindAll);
-                        var val  = prop?.GetValue(nested);
-                        if (val is Uri nu) return nu.ToString().TrimEnd('/');
-                        if (val is string ns && ns.StartsWith("http")) return ns.TrimEnd('/');
-                    }
-                }
-            }
-            catch { /* best-effort */ }
-
-            // Approach 2: probe well-known localhost ports
-            // Foundry Local typically uses a port in the 5270-5280 range.
-            SafeUI(() => Status("🔍  Probing Foundry Local port…"));
-            foreach (int port in new[] { 5273, 5274, 5272, 5271, 5275, 5270, 5276, 5280, 5300 })
-            {
-                try
-                {
-                    var candidate = $"http://localhost:{port}";
-                    using var cts  = new System.Threading.CancellationTokenSource(
-                        TimeSpan.FromSeconds(2));
-                    // /v1/models is standard on OpenAI-compatible servers
-                    var resp = await _http.GetAsync($"{candidate}/v1/models", cts.Token);
-                    // Any HTTP response (even 404) means a server is listening
-                    if ((int)resp.StatusCode < 500)
-                        return candidate;
-                }
-                catch { /* port not open */ }
-            }
-
-            return null;
-        }
-
         // ── Record toggle ─────────────────────────────────────────────────────────
 
         private async Task ToggleRecordingAsync()
         {
-            if (_isRecording) { StopRecording(); return; }
+            if (_isRecording) { await StopRecordingAsync(); return; }
 
             var item     = _cmbEngine.SelectedItem as EngineItem;
             int micIndex = (_cmbMic.SelectedItem as MicItem)?.DeviceIndex ?? 0;
@@ -491,32 +407,43 @@ namespace FoundrySTT
             _isRecording = true;
             SafeUI(() =>
             {
-                _btnRecord.Text     = "⏹  Stop Recording";
+                _btnRecord.Text      = "⏹  Stop Recording";
                 _btnRecord.BackColor = ColRed;
-                _cmbEngine.Enabled  = false;
-                _cmbMic.Enabled     = false;
+                _cmbEngine.Enabled   = false;
+                _cmbMic.Enabled      = false;
             });
 
             if (item?.Model == null)
-                await Task.Run(() => StartWindowsStt());        // Windows STT
+                await Task.Run(() => StartWindowsStt());          // Windows STT
             else
-                StartWhisperCapture(micIndex, item.Model.Alias); // Foundry Whisper
+                await StartWhisperCaptureAsync(micIndex);         // Foundry SDK native
 
             Status("🔴  Recording…  speak now");
         }
 
-        private void StopRecording()
+        private async Task StopRecordingAsync()
         {
             _isRecording = false;
 
             // Stop Windows STT
             try { _sre?.RecognizeAsyncStop(); } catch { }
 
-            // Stop NAudio + Whisper timer
-            _whisperTimer?.Stop();
-            _whisperTimer?.Dispose();
-            _whisperTimer = null;
+            // Stop microphone capture
             try { _waveIn?.StopRecording(); } catch { }
+
+            // Signal the live session to flush + finish, then wait for the stream task
+            _liveCts?.Cancel();
+            if (_liveSession != null)
+            {
+                var s = _liveSession;
+                _liveSession = null;
+                try { await s.StopAsync(); } catch { }
+            }
+            if (_liveStreamTask != null)
+            {
+                try { await _liveStreamTask; } catch { }
+                _liveStreamTask = null;
+            }
 
             SafeUI(() =>
             {
@@ -539,9 +466,8 @@ namespace FoundrySTT
                 _sre.LoadGrammar(new DictationGrammar());
 
                 // Near-realtime: show hypothesis (gray) as user speaks
-                _sre.SpeechHypothesized  += (s, e) => SafeUI(() => ShowInterim(e.Result.Text));
-                // Final recognition: commit confirmed words (white)
-                _sre.SpeechRecognized    += (s, e) => SafeUI(() => CommitText(e.Result.Text + " "));
+                _sre.SpeechHypothesized        += (s, e) => SafeUI(() => ShowInterim(e.Result.Text));
+                _sre.SpeechRecognized          += (s, e) => SafeUI(() => CommitText(e.Result.Text + " "));
                 _sre.SpeechRecognitionRejected += (s, e) => SafeUI(ClearInterim);
 
                 _sre.SetInputToDefaultAudioDevice();
@@ -552,121 +478,90 @@ namespace FoundrySTT
                 SafeUI(() =>
                 {
                     Status($"❌  Windows STT error: {ex.Message}");
-                    _isRecording = false;
+                    _isRecording         = false;
                     _btnRecord.Text      = "🎤  Start Recording";
                     _btnRecord.BackColor = Teal;
                 });
             }
         }
 
-        // ── Foundry Whisper — NAudio capture + HTTP transcription ─────────────────
+        // ── Foundry Whisper — SDK-native live transcription (no HTTP) ─────────────
 
-        private void StartWhisperCapture(int micIndex, string modelAlias)
+        private async Task StartWhisperCaptureAsync(int micIndex)
         {
-            var waveFormat = new WaveFormat(16000, 16, 1); // 16 kHz mono — Whisper's native format
-            _audioBuffer   = new MemoryStream();
-            _waveWriter    = new WaveFileWriter(_audioBuffer, waveFormat);
-
-            _waveIn = new WaveInEvent
+            if (_audioClient == null)
             {
-                DeviceNumber       = micIndex,
-                WaveFormat         = waveFormat,
-                BufferMilliseconds = 100
-            };
-            _waveIn.DataAvailable += (s, e) =>
-            {
-                lock (_audioBuffer) _waveWriter?.Write(e.Buffer, 0, e.BytesRecorded);
-            };
-            _waveIn.StartRecording();
-
-            // Flush a chunk to Whisper every 4 seconds
-            _whisperTimer = new System.Windows.Forms.Timer { Interval = 4000 };
-            _whisperTimer.Tick += async (s, e) =>
-            {
-                if (_sendingChunk) return;
-                _sendingChunk = true;
-                try   { await SendWhisperChunkAsync(modelAlias); }
-                finally { _sendingChunk = false; }
-            };
-            _whisperTimer.Start();
-        }
-
-        private async Task SendWhisperChunkAsync(string modelAlias)
-        {
-            if (_audioBuffer == null || _waveWriter == null) return;
-
-            // Re-attempt endpoint discovery if we don't have it yet
-            if (string.IsNullOrEmpty(_foundryEndpoint))
-            {
-                _foundryEndpoint = await TryGetFoundryEndpointAsync(_activeModel!);
-                if (string.IsNullOrEmpty(_foundryEndpoint))
-                {
-                    SafeUI(() => AppendSystemLine(
-                        "[Whisper endpoint not found — check that Foundry Local is running " +
-                        "and the model is loaded, then try again]"));
-                    StopRecording();
-                    return;
-                }
-                SafeUI(() => Status($"🔗  Endpoint: {_foundryEndpoint}  •  transcribing…"));
+                SafeUI(() => AppendSystemLine("[Audio client not ready — load a model first]"));
+                await StopRecordingAsync();
+                return;
             }
-
-            byte[] wavBytes;
-            lock (_audioBuffer)
-            {
-                _waveWriter.Flush();
-                wavBytes = _audioBuffer.ToArray();
-
-                // Reset buffer for next chunk
-                var fmt = _waveWriter.WaveFormat;
-                _audioBuffer.SetLength(0);
-                _audioBuffer.Position = 0;
-                _waveWriter.Dispose();
-                _waveWriter = new WaveFileWriter(_audioBuffer, fmt);
-            }
-
-            // A valid WAV header is 44 bytes; skip near-silent / too-short chunks
-            if (wavBytes.Length < 44 + 3200) return;
 
             try
             {
-                using var content    = new MultipartFormDataContent();
-                var fileContent      = new ByteArrayContent(wavBytes);
-                fileContent.Headers.ContentType = new MediaTypeHeaderValue("audio/wav");
-                content.Add(fileContent, "file", "audio.wav");
-                content.Add(new StringContent(modelAlias), "model");
-                content.Add(new StringContent("json"),     "response_format");
+                // Create and configure the live transcription session
+                _liveSession = _audioClient.CreateLiveTranscriptionSession();
+                _liveSession.Settings.SampleRate = 16000;
+                _liveSession.Settings.Channels   = 1;
+                _liveSession.Settings.Language   = "en";
+                await _liveSession.StartAsync();
 
-                var resp = await _http.PostAsync(
-                    $"{_foundryEndpoint}/v1/audio/transcriptions", content);
+                _liveCts = new CancellationTokenSource();
+                var session = _liveSession; // capture for closure
 
-                if (resp.IsSuccessStatusCode)
+                // Background task: read transcription results as they arrive
+                _liveStreamTask = Task.Run(async () =>
                 {
-                    var json = await resp.Content.ReadAsStringAsync();
-                    // Parse minimal {"text":"..."} response
-                    string text = ExtractJsonText(json);
-                    if (!string.IsNullOrWhiteSpace(text))
-                        SafeUI(() => CommitText(text.Trim() + " "));
-                }
+                    try
+                    {
+                        await foreach (var result in session.GetStream())
+                        {
+                            string text = result.Content?.Count > 0
+                                ? (result.Content[0].Text ?? result.Content[0].Transcript ?? "")
+                                : "";
+
+                            if (string.IsNullOrWhiteSpace(text)) continue;
+
+                            if (result.IsFinal)
+                                SafeUI(() => CommitText(text.Trim() + " "));
+                            else
+                                SafeUI(() => ShowInterim(text));
+                        }
+                    }
+                    catch (OperationCanceledException) { /* normal stop */ }
+                    catch (Exception ex)
+                    {
+                        File.AppendAllText(Program.LogFile,
+                            $"[{DateTime.Now:HH:mm:ss}] Whisper stream error: {ex}\n");
+                        SafeUI(() => AppendSystemLine($"[Transcription error: {ex.Message}]"));
+                    }
+                });
+
+                // Start microphone — push raw 16-bit PCM directly to the SDK session
+                var waveFormat = new WaveFormat(16000, 16, 1);
+                _waveIn = new WaveInEvent
+                {
+                    DeviceNumber       = micIndex,
+                    WaveFormat         = waveFormat,
+                    BufferMilliseconds = 100
+                };
+                _waveIn.DataAvailable += (s, e) =>
+                {
+                    if (session != null && _isRecording && e.BytesRecorded > 0)
+                        _ = session.AppendAsync(
+                            new ReadOnlyMemory<byte>(e.Buffer, 0, e.BytesRecorded));
+                };
+                _waveIn.StartRecording();
             }
             catch (Exception ex)
             {
-                File.AppendAllText(Program.LogFile,
-                    $"[{DateTime.Now:HH:mm:ss}] Whisper chunk error: {ex.Message}\n");
+                File.AppendAllText(Program.LogFile, $"[{DateTime.Now:HH:mm:ss}] Start error: {ex}\n");
+                SafeUI(() =>
+                {
+                    AppendSystemLine($"[Failed to start Whisper session: {ex.Message}]");
+                    Status($"❌  {ex.Message}");
+                });
+                await StopRecordingAsync();
             }
-        }
-
-        private static string ExtractJsonText(string json)
-        {
-            // Simple extraction: {"text":"..."} — no external JSON parser needed
-            int keyIdx = json.IndexOf("\"text\"", StringComparison.Ordinal);
-            if (keyIdx < 0) return string.Empty;
-            int colon = json.IndexOf(':', keyIdx + 6);
-            if (colon < 0) return string.Empty;
-            int open  = json.IndexOf('"', colon + 1);
-            if (open < 0) return string.Empty;
-            int close = json.IndexOf('"', open + 1);
-            if (close < 0) return string.Empty;
-            return json.Substring(open + 1, close - open - 1);
         }
 
         // ── Transcript display ────────────────────────────────────────────────────
@@ -718,12 +613,13 @@ namespace FoundrySTT
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
         {
-            StopRecording();
+            _isRecording = false;
+            _liveCts?.Cancel();
+            try { _sre?.RecognizeAsyncStop(); } catch { }
+            try { _waveIn?.StopRecording(); } catch { }
+            try { _liveSession?.StopAsync().GetAwaiter().GetResult(); } catch { }
             _sre?.Dispose();
             _waveIn?.Dispose();
-            _waveWriter?.Dispose();
-            _audioBuffer?.Dispose();
-            _http.Dispose();
             if (FoundryLocalManager.IsInitialized)
                 try { FoundryLocalManager.Instance.Dispose(); } catch { }
         }
