@@ -16,13 +16,12 @@ https://rzetelnekursy.pl/foundry-local-orion-edge-ai-sdk/
 
 ## Repository Structure
 
-This repository contains four generated solutions:
+This repository contains two generated solutions:
 
 ```text
 Solution01/   — .NET 9 WinForms app (self-contained, win-x64)
 Solution02/   — .NET Framework 4.8 WinForms chat app (win-x64)
 Solution03/   — .NET Framework 4.8 WinForms Voice-to-Text app (win-x64)
-Solution04/   — .NET Framework 4.8 WinForms Document Q&A app (win-x64)
 ```
 
 ### Solution01
@@ -49,16 +48,6 @@ The application was developed iteratively using prompts entered during the sessi
 - **Foundry Local Whisper models** (if available in catalog): select a transcription model, download it, and use it for higher-accuracy chunk-based transcription
 - Microphone device selector — choose which input device to use
 - Live scrolling transcript panel
-
-### Solution04
-
-`Solution04` is a Document Q&A application generated using GitHub Copilot CLI ("yolo" + "autopilot" prompts).
-
-- **Drag & drop** any text, code, or markdown file onto the window
-- The document is injected as context into the AI system prompt (RAG-lite, no embeddings)
-- Ask questions about the document, or click **✦ Summarise** for an instant summary
-- Multi-turn chat history; context resets when a new document is loaded
-- Works as a general-purpose chatbot when no document is loaded
 
 ## Prompt History
 
@@ -98,7 +87,6 @@ Pre-built ZIP files are attached to every [GitHub Release](https://github.com/Ma
 | `Solution01.zip` | .NET 9 WinForms chat app, self-contained win-x64 | Windows 10 1903+, [VC++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
 | `Solution02.zip` | .NET Framework 4.8 WinForms chat app, win-x64  | Windows 10 1803+, [VC++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
 | `Solution03.zip` | .NET Framework 4.8 WinForms Voice-to-Text, win-x64 | Windows 10 1803+, [VC++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
-| `Solution04.zip` | .NET Framework 4.8 WinForms Document Q&A, win-x64 | Windows 10 1803+, [VC++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
 
 ### How to run after downloading
 
