@@ -380,7 +380,9 @@ namespace FoundrySTT
                     _btnLoad.Text      = "✅  Loaded";
                     _btnLoad.Enabled   = false;
                     _btnRecord.Enabled = true;
-                    _lblEngineInfo.Text = $"  ✓ Loaded • {_foundryEndpoint ?? "endpoint unknown"}";
+                    _lblEngineInfo.Text = _foundryEndpoint != null
+                        ? $"  ✓ Loaded • endpoint: {_foundryEndpoint}"
+                        : "  ✓ Loaded • endpoint will be probed on first chunk";
                 });
 
                 Status($"✅  {item.Model.Alias} ready — press Record to start");
@@ -397,52 +399,82 @@ namespace FoundrySTT
             }
         }
 
-        // Try several ways to find the Foundry Local HTTP base URL
-        private async Task<string?> TryGetFoundryEndpointAsync(IModel model)
+        // Find the Foundry Local HTTP base URL (needed for /v1/audio/transcriptions)
+        private async Task<string?> TryGetFoundryEndpointAsync(IModel _)
         {
+            // NOTE: do NOT call model.GetChatClientAsync() here — Whisper models are
+            // not chat models and that call will throw or return an incompatible client.
+
+            var bindAll = System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic
+                        | System.Reflection.BindingFlags.Instance;
+
+            // Approach 1: reflect on FoundryLocalManager.Instance directly
             try
             {
-                // Approach 1: inspect the chat client object via reflection
-                var chatClient = await model.GetChatClientAsync();
-                var type       = chatClient.GetType();
+                var mgr  = FoundryLocalManager.Instance;
+                var type = mgr.GetType();
 
-                foreach (var name in new[] { "BaseUrl", "BaseAddress", "Endpoint", "ServiceUri", "ApiUrl" })
+                // Check public + private properties
+                foreach (var name in new[] {
+                    "ServiceUri", "Endpoint", "BaseAddress", "ServiceUrl",
+                    "BaseUrl", "Uri", "LocalEndpoint", "ServerUri" })
                 {
-                    var prop = type.GetProperty(name,
-                        System.Reflection.BindingFlags.Public |
-                        System.Reflection.BindingFlags.NonPublic |
-                        System.Reflection.BindingFlags.Instance);
-                    var val = prop?.GetValue(chatClient)?.ToString();
-                    if (!string.IsNullOrEmpty(val)) return val.TrimEnd('/');
+                    var prop = type.GetProperty(name, bindAll);
+                    if (prop == null) continue;
+                    var val = prop.GetValue(mgr);
+                    if (val is Uri u)  return u.ToString().TrimEnd('/');
+                    if (val is string s && s.StartsWith("http")) return s.TrimEnd('/');
                 }
 
-                // Approach 2: find an HttpClient field inside the chat client
-                foreach (var field in type.GetFields(
-                    System.Reflection.BindingFlags.NonPublic |
-                    System.Reflection.BindingFlags.Instance))
+                // Check fields (SDK often stores state in private fields)
+                foreach (var field in type.GetFields(bindAll))
                 {
-                    if (field.FieldType == typeof(HttpClient))
+                    var val = field.GetValue(mgr);
+                    if (val is Uri u && u.IsAbsoluteUri)
+                        return u.ToString().TrimEnd('/');
+                    if (val is string s &&
+                        (s.StartsWith("http://localhost") ||
+                         s.StartsWith("http://127.0.0.1")))
+                        return s.TrimEnd('/');
+                }
+
+                // Recurse one level into nested objects (e.g. mgr._server.Endpoint)
+                foreach (var field in type.GetFields(bindAll))
+                {
+                    var nested = field.GetValue(mgr);
+                    if (nested == null || nested.GetType().IsPrimitive) continue;
+                    var ntype = nested.GetType();
+                    foreach (var name in new[] {
+                        "ServiceUri", "Endpoint", "BaseAddress", "Uri", "Address" })
                     {
-                        var http = field.GetValue(chatClient) as HttpClient;
-                        var addr = http?.BaseAddress?.ToString().TrimEnd('/');
-                        if (!string.IsNullOrEmpty(addr)) return addr;
+                        var prop = ntype.GetProperty(name, bindAll);
+                        var val  = prop?.GetValue(nested);
+                        if (val is Uri nu) return nu.ToString().TrimEnd('/');
+                        if (val is string ns && ns.StartsWith("http")) return ns.TrimEnd('/');
                     }
-                }
-
-                // Approach 3: inspect FoundryLocalManager for a ServiceUri property
-                var mgr     = FoundryLocalManager.Instance;
-                var mgrType = mgr.GetType();
-                foreach (var name in new[] { "ServiceUri", "Endpoint", "BaseAddress", "ServiceUrl" })
-                {
-                    var prop = mgrType.GetProperty(name,
-                        System.Reflection.BindingFlags.Public |
-                        System.Reflection.BindingFlags.NonPublic |
-                        System.Reflection.BindingFlags.Instance);
-                    var val = prop?.GetValue(mgr)?.ToString();
-                    if (!string.IsNullOrEmpty(val)) return val.TrimEnd('/');
                 }
             }
             catch { /* best-effort */ }
+
+            // Approach 2: probe well-known localhost ports
+            // Foundry Local typically uses a port in the 5270-5280 range.
+            SafeUI(() => Status("🔍  Probing Foundry Local port…"));
+            foreach (int port in new[] { 5273, 5274, 5272, 5271, 5275, 5270, 5276, 5280, 5300 })
+            {
+                try
+                {
+                    var candidate = $"http://localhost:{port}";
+                    using var cts  = new System.Threading.CancellationTokenSource(
+                        TimeSpan.FromSeconds(2));
+                    // /v1/models is standard on OpenAI-compatible servers
+                    var resp = await _http.GetAsync($"{candidate}/v1/models", cts.Token);
+                    // Any HTTP response (even 404) means a server is listening
+                    if ((int)resp.StatusCode < 500)
+                        return candidate;
+                }
+                catch { /* port not open */ }
+            }
 
             return null;
         }
@@ -562,11 +594,20 @@ namespace FoundrySTT
         private async Task SendWhisperChunkAsync(string modelAlias)
         {
             if (_audioBuffer == null || _waveWriter == null) return;
+
+            // Re-attempt endpoint discovery if we don't have it yet
             if (string.IsNullOrEmpty(_foundryEndpoint))
             {
-                SafeUI(() => AppendSystemLine("[Whisper endpoint not found — cannot transcribe]"));
-                StopRecording();
-                return;
+                _foundryEndpoint = await TryGetFoundryEndpointAsync(_activeModel!);
+                if (string.IsNullOrEmpty(_foundryEndpoint))
+                {
+                    SafeUI(() => AppendSystemLine(
+                        "[Whisper endpoint not found — check that Foundry Local is running " +
+                        "and the model is loaded, then try again]"));
+                    StopRecording();
+                    return;
+                }
+                SafeUI(() => Status($"🔗  Endpoint: {_foundryEndpoint}  •  transcribing…"));
             }
 
             byte[] wavBytes;
