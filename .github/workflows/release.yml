@@ -76,6 +76,21 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path publish/Solution03/* -DestinationPath Solution03.zip
 
+      # ── Solution04 (Solution04 folder — .NET Framework 4.8, Document Q&A) ──────
+
+      - name: Restore Solution04 packages
+        run: dotnet restore Solution04/FoundryDocChat.csproj
+
+      - name: Publish Solution04 (.NET Framework 4.8, win-x64)
+        run: >
+          dotnet publish Solution04/FoundryDocChat.csproj
+          -c Release
+          -o publish/Solution04
+
+      - name: Zip Solution04
+        shell: pwsh
+        run: Compress-Archive -Path publish/Solution04/* -DestinationPath Solution04.zip
+
       # ── Determine release tag ────────────────────────────────────────────────────
 
       - name: Determine release tag
@@ -171,6 +186,26 @@ jobs:
 
             > ⚠ The app will warn you at startup if the VC++ Redistributable is missing.
 
+            ### 📦 Solution04 — .NET Framework 4.8 Document Q&A App
+
+            **⬇ Download: `Solution04.zip`**
+
+            - Built with .NET Framework 4.8 WinForms
+            - **Drag & drop** any text, code, or markdown file onto the window
+            - Chat with the AI about the loaded document — questions answered in document context
+            - **✦ Summarise** button for instant one-click summaries
+            - General-purpose chat when no document is loaded
+            - Multi-turn conversation history; context resets on new document load
+
+            **System Requirements:**
+            | Requirement | Details |
+            |---|---|
+            | OS | Windows 10 version 1803 or later |
+            | .NET Framework 4.8 | Pre-installed on Windows 10 1803+ — [⬇ Download if needed](https://dotnet.microsoft.com/en-us/download/dotnet-framework/net48) |
+            | VC++ Redistributable | **Required** — [⬇ Download Visual C++ 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+
+            > ⚠ The app will warn you at startup if the VC++ Redistributable is missing.
+
             ---
 
 
@@ -185,5 +220,6 @@ jobs:
             Solution01.zip
             Solution02.zip
             Solution03.zip
+            Solution04.zip
           draft: false
           prerelease: false
