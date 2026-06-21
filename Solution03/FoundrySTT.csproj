@@ -27,6 +27,8 @@
     <!-- NAudio — microphone capture for Whisper mode -->
     <PackageReference Include="NAudio" Version="2.2.1" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.15" />
+    <!-- Channel-based audio buffer (needed for net48 — built-in only in .NET Core 3+) -->
+    <PackageReference Include="System.Threading.Channels" Version="9.0.0" />
   </ItemGroup>
 
 </Project>

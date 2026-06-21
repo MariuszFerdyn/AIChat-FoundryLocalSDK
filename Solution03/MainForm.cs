@@ -6,6 +6,7 @@ using System.Linq;
 using System.Management;
 using System.Speech.Recognition;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.AI.Foundry.Local;
@@ -46,6 +47,9 @@ namespace FoundrySTT
         private LiveAudioTranscriptionSession? _liveSession;
         private Task?                         _liveStreamTask;
         private CancellationTokenSource?      _liveCts;
+        // Channel-based audio push to avoid fire-and-forget AppendAsync in DataAvailable handler
+        private Channel<byte[]>?              _audioChannel;
+        private Task?                         _appendTask;
 
         // ── Whisper buffer mode (file-based transcription) ────────────────────────
         private WaveFileWriter?               _whisperWriter;
@@ -222,6 +226,27 @@ namespace FoundrySTT
                     new Configuration { AppName = "FoundrySTT" },
                     NullLogger.Instance);
 
+                // Register all available EPs (GPU/NPU/DirectML) so the catalog
+                // includes hardware-accelerated model variants.
+                // Without this, only CPU models appear in the catalog.
+                Status("🔌  Registering execution providers (GPU/NPU)…");
+                try
+                {
+                    string curEp = "";
+                    await FoundryLocalManager.Instance.DownloadAndRegisterEpsAsync((epName, pct) =>
+                    {
+                        if (epName != curEp)
+                        {
+                            curEp = epName;
+                            Status($"🔌  Registering {epName}…  {pct:F0}%");
+                        }
+                    });
+                }
+                catch { /* non-critical — catalog still works with CPU-only EPs */ }
+
+                // Re-render hardware panel now that EPs are registered
+                await Task.Run(() => LoadHardwareInfo());
+
                 Status("📋  Loading model catalog…");
                 var catalog = await FoundryLocalManager.Instance.GetCatalogAsync();
                 var all     = (await catalog.ListModelsAsync()).ToList();
@@ -313,11 +338,20 @@ namespace FoundrySTT
                 {
                     using var q = new ManagementObjectSearcher(
                         "SELECT Name FROM Win32_VideoController");
+                    string firstGpu = "";
                     foreach (ManagementObject o in q.Get())
                     {
                         string name = o["Name"]?.ToString()?.Trim() ?? "";
-                        if (!string.IsNullOrEmpty(name)) { gpu = name; break; }
+                        if (string.IsNullOrEmpty(name)) continue;
+                        if (string.IsNullOrEmpty(firstGpu)) firstGpu = name;
+                        // Prefer discrete GPU over Intel integrated graphics
+                        if (name.IndexOf("NVIDIA",  StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            name.IndexOf("GeForce", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            name.IndexOf("AMD",     StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            name.IndexOf("Radeon",  StringComparison.OrdinalIgnoreCase) >= 0)
+                        { gpu = name; break; }
                     }
+                    if (string.IsNullOrEmpty(gpu)) gpu = firstGpu;
                 }
                 catch { /* ignore GPU detection failures */ }
 
@@ -470,11 +504,34 @@ namespace FoundrySTT
         {
             _isRecording = false;
 
+            // Reset button IMMEDIATELY so the user gets instant feedback
+            // (transcription may take several seconds after this point)
+            SafeUI(() =>
+            {
+                _btnRecord.Text      = "🎤  Start Recording";
+                _btnRecord.BackColor = Teal;
+                _cmbEngine.Enabled   = true;
+                _cmbMic.Enabled      = true;
+            });
+            Status("⏸  Stopping…");
+
             // Stop Windows STT
             try { _sre?.RecognizeAsyncStop(); } catch { }
 
             // Stop microphone capture
             try { _waveIn?.StopRecording(); } catch { }
+
+            // Complete the audio channel so the appendTask consumer can finish
+            if (_audioChannel != null)
+            {
+                _audioChannel.Writer.Complete();
+                _audioChannel = null;
+            }
+            if (_appendTask != null)
+            {
+                try { await _appendTask; } catch { }
+                _appendTask = null;
+            }
 
             // Signal the live session to flush + finish, then wait for the stream task
             _liveCts?.Cancel();
@@ -490,7 +547,7 @@ namespace FoundrySTT
                 _liveStreamTask = null;
             }
 
-            // Whisper buffer mode: finalize file and transcribe
+            // Whisper buffer mode: finalize file and transcribe (streaming for progressive display)
             if (_whisperWriter != null)
             {
                 var writer   = _whisperWriter;
@@ -508,13 +565,17 @@ namespace FoundrySTT
                         Status("⏳  Transcribing audio…");
                         try
                         {
-                            var response = await Task.Run(() =>
-                                _audioClient!.TranscribeAudioAsync(tempFile).GetAwaiter().GetResult());
-
-                            string text = response?.Text ?? "";
-                            if (!string.IsNullOrWhiteSpace(text))
-                                SafeUI(() => CommitText(text.Trim() + "\n"));
-                            else
+                            bool gotText = false;
+                            var response = _audioClient!.TranscribeAudioStreamingAsync(tempFile, CancellationToken.None);
+                            await foreach (var chunk in response)
+                            {
+                                if (!string.IsNullOrWhiteSpace(chunk.Text))
+                                {
+                                    gotText = true;
+                                    SafeUI(() => CommitText(chunk.Text));
+                                }
+                            }
+                            if (!gotText)
                                 SafeUI(() => AppendSystemLine("[No speech detected]"));
                         }
                         catch (Exception ex)
@@ -535,14 +596,7 @@ namespace FoundrySTT
                 }
             }
 
-            SafeUI(() =>
-            {
-                _btnRecord.Text      = "🎤  Start Recording";
-                _btnRecord.BackColor = Teal;
-                _cmbEngine.Enabled   = true;
-                _cmbMic.Enabled      = true;
-            });
-            Status("⏸  Stopped");
+            Status("✅  Done");
         }
 
         // ── Windows Speech Recognition ────────────────────────────────────────────
@@ -670,7 +724,8 @@ namespace FoundrySTT
                     }
                 });
 
-                // Start microphone — push raw 16-bit PCM directly to the SDK session
+                // Start microphone — push raw 16-bit PCM to the SDK session via a Channel
+                // to avoid fire-and-forget AppendAsync calls inside the synchronous DataAvailable handler.
                 var waveFormat = new WaveFormat(16000, 16, 1);
                 _waveIn = new WaveInEvent
                 {
@@ -678,11 +733,26 @@ namespace FoundrySTT
                     WaveFormat         = waveFormat,
                     BufferMilliseconds = 100
                 };
+
+                _audioChannel = Channel.CreateBounded<byte[]>(
+                    new BoundedChannelOptions(50)
+                    { FullMode = BoundedChannelFullMode.DropOldest });
+
+                var capturedSession = session;
+                _appendTask = Task.Run(async () =>
+                {
+                    await foreach (var chunk in _audioChannel.Reader.ReadAllAsync())
+                        await capturedSession.AppendAsync(new ReadOnlyMemory<byte>(chunk));
+                });
+
                 _waveIn.DataAvailable += (s, e) =>
                 {
-                    if (session != null && _isRecording && e.BytesRecorded > 0)
-                        _ = session.AppendAsync(
-                            new ReadOnlyMemory<byte>(e.Buffer, 0, e.BytesRecorded));
+                    if (_isRecording && e.BytesRecorded > 0)
+                    {
+                        var buf = new byte[e.BytesRecorded];
+                        Buffer.BlockCopy(e.Buffer, 0, buf, 0, e.BytesRecorded);
+                        _audioChannel.Writer.TryWrite(buf);
+                    }
                 };
                 _waveIn.StartRecording();
             }

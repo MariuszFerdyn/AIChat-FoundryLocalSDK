@@ -315,7 +315,25 @@ namespace FoundryChatApp
                     new Configuration { AppName = "FoundryChatApp" },
                     NullLogger.Instance);
 
-                // Re-render hardware panel now that EPs are available
+                // Register all available EPs (GPU/NPU/DirectML) so the catalog
+                // includes hardware-accelerated model variants.
+                // Without this, only CPU models appear.
+                Status("🔌  Registering execution providers (GPU/NPU)…");
+                try
+                {
+                    string curEp = "";
+                    await FoundryLocalManager.Instance.DownloadAndRegisterEpsAsync((epName, pct) =>
+                    {
+                        if (epName != curEp)
+                        {
+                            curEp = epName;
+                            Status($"🔌  Registering {epName}…  {pct:F0}%");
+                        }
+                    });
+                }
+                catch { /* non-critical — catalog still works with CPU-only EPs */ }
+
+                // Re-render hardware panel now that EPs are registered
                 await Task.Run(() => LoadHardwareInfo());
 
                 Status("📋  Loading model catalog…");
