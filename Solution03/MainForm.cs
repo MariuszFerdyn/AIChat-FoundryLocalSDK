@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.AI.Foundry.Local;
+using Microsoft.AI.Foundry.Local.OpenAI;
 using Microsoft.Extensions.Logging.Abstractions;
 using NAudio.Wave;
 
