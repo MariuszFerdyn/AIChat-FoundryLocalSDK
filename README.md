@@ -16,8 +16,6 @@ https://rzetelnekursy.pl/foundry-local-orion-edge-ai-sdk/
 
 ## Repository Structure
 
-This repository contains two generated solutions:
-
 ```text
 Solution01/   — .NET 9 WinForms app (self-contained, win-x64)
 Solution02/   — .NET Framework 4.8 WinForms chat app (win-x64)
@@ -40,14 +38,32 @@ The application was developed iteratively using prompts entered during the sessi
 
 ![Solution02 Screenshot](Solution01.jpg)
 
+**Features:**
+- Lists all available Foundry Local models, each GPU and CPU variant shown as a **separate entry** (GPU listed first)
+- Shows hardware info panel: CPU, RAM, GPU name, available execution providers
+- Download & load any model variant directly from the UI
+- GPU is the preferred device — if a GPU variant is available it is listed first and pre-selected
+- Real-time streaming chat responses
+- Conversation history maintained across turns
+
 ### Solution03
 
 `Solution03` is a Voice-to-Text application generated using GitHub Copilot CLI.
 
-- **Windows Speech Recognition** (built-in, near-realtime): shows hypothesis words in gray as you speak, confirms them in white when recognised
-- **Foundry Local Whisper models** (if available in catalog): select a transcription model, download it, and use it for higher-accuracy chunk-based transcription
+**Engines supported:**
+- **Windows Speech Recognition** (built-in, near-realtime): shows hypothesis words in gray as you speak, confirms them in white when recognised — no model download required
+- **Foundry Local Whisper models**: record audio, then get a full transcription when you press Stop (buffer-and-transcribe mode — Whisper does not support live streaming)
+- **Foundry Local Nemotron speech models**: live streaming transcription with real-time word-by-word results
+
+**Key features:**
+- Each model variant (GPU / CPU) is listed separately in the dropdown — GPU listed first
+- Hardware info panel shows CPU, RAM, GPU name, and microphone count
 - Microphone device selector — choose which input device to use
+- "▶ Load into Memory" button appears for already-downloaded models so you can activate them without re-downloading
+- Record button is only enabled once a model is loaded and ready
 - Live scrolling transcript panel
+
+> ℹ️ For Whisper models: press **Start Recording**, speak, then press **Stop Recording** — the transcription appears after you stop. For Nemotron models transcription appears in real time while you speak.
 
 ## Prompt History
 
@@ -78,6 +94,19 @@ The GitHub Actions workflow (`.github/workflows/release.yml`) was also generated
 | 2  | I need to compile the on every commit. Not manual                                                                                                                              |
 | 3  | Add to README.MD the picture of Solution01 Solution01.jpg. Also Add the prompts that create Github Actions. Also add information that Solution00 needs to be fixed just seems initialising SDK doesnt work. |
 
+### Post-event fixes applied via GitHub Copilot CLI
+
+The following bugs and improvements were applied after the event using GitHub Copilot CLI:
+
+| Fix | Solutions | Description |
+| --- | --------- | ----------- |
+| Missing `using` directive | Solution03 | Added `using Microsoft.AI.Foundry.Local.OpenAI` to resolve `LiveAudioTranscriptionSession` compilation error |
+| Whisper streaming error | Solution03 | `LiveAudioTranscriptionSession` only works with Nemotron speech models. Whisper now buffers audio to a temp WAV file and calls `TranscribeAudioAsync()` on stop |
+| GPU support | Solution02, Solution03 | GPU model variants listed separately (first) and loaded by default when available |
+| Per-variant selection | Solution02, Solution03 | Each GPU/CPU variant shown as a separate list entry — user can explicitly choose the device |
+| Load button bug | Solution03 | Downloaded-but-not-loaded models now show "▶ Load into Memory" (enabled); Record only activates after loading |
+| Hardware GPU display | Solution03 | GPU name shown in hardware info panel via WMI |
+
 ## Downloads
 
 Pre-built ZIP files are attached to every [GitHub Release](https://github.com/MariuszFerdyn/AIChat-FoundryLocalSDK/releases/latest).
@@ -99,7 +128,7 @@ Pre-built ZIP files are attached to every [GitHub Release](https://github.com/Ma
 4. Double-click the `.exe` to launch the app.
 5. If Windows SmartScreen still appears, click **More info** → **Run anyway**.
 6. On first launch, Foundry Local initialises and fetches the model catalog — **this takes a few seconds**, please wait for the list to populate before clicking anything.
-7. Select a model, click **Download & Load**, and start chatting.
+7. Select a model variant (GPU variants are listed first), click **Download & Load**, and start chatting / recording.
 
 ## License
 by AI... so feel free to use.
