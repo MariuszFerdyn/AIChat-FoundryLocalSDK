@@ -338,7 +338,8 @@ namespace FoundryChatApp
                             : "  ?  ";
                         // Pad alias to fixed width for column alignment
                         string alias       = (m.Alias ?? "").PadRight(24);
-                        _lstModels.Items.Add($"{cached_mark} {alias} {sizePart,7}");
+                        string devTag      = DeviceTag(m);
+                        _lstModels.Items.Add($"{cached_mark} {alias} {sizePart,7}  {devTag}");
                     }
                     _lstModels.EndUpdate();
 
@@ -389,6 +390,8 @@ namespace FoundryChatApp
 
             if (!string.IsNullOrEmpty(info?.Publisher))
                 parts.Add($"by {info.Publisher}");
+
+            parts.Add(DeviceTag(m));
 
             _lblModelInfo.Text   = parts.Count > 0 ? "  " + string.Join("  │  ", parts) : $"  {info?.DisplayName ?? m.Alias}";
             _btnDownload.Enabled = !_busy;
@@ -621,6 +624,29 @@ namespace FoundryChatApp
         // ── UI factory helpers ─────────────────────────────────────────────────────
 
         private static Color Rgb(int r, int g, int b) => Color.FromArgb(r, g, b);
+
+        // Returns a [GPU], [CPU], [GPU+CPU], etc. tag based on available variants.
+        private static string DeviceTag(IModel m)
+        {
+            var types = m.Variants
+                .Select(v => v.Info?.Runtime?.DeviceType ?? DeviceType.Invalid)
+                .Where(d => d != DeviceType.Invalid)
+                .Distinct()
+                .ToList();
+            if (!types.Any())
+            {
+                var own = m.Info?.Runtime?.DeviceType ?? DeviceType.Invalid;
+                if (own != DeviceType.Invalid) types.Add(own);
+            }
+            bool gpu = types.Contains(DeviceType.GPU);
+            bool npu = types.Contains(DeviceType.NPU);
+            bool cpu = types.Contains(DeviceType.CPU) || !types.Any();
+            var parts = new List<string>();
+            if (gpu) parts.Add("GPU");
+            if (npu) parts.Add("NPU");
+            if (cpu) parts.Add("CPU");
+            return $"[{string.Join("+", parts.DefaultIfEmpty("CPU"))}]";
+        }
 
         private static Panel MakePanel(DockStyle dock, Color back, int width = 0, int height = 0)
         {

@@ -241,8 +241,9 @@ namespace FoundrySTT
                             ? $"  ({m.Info.FileSizeMb.Value / 1024.0:F1} GB)" : "";
                         bool   cached = m.Info?.Cached ?? false;
                         string mark   = cached ? "✓ " : "";
+                        string devTag = DeviceTag(m);
                         _cmbEngine.Items.Add(new EngineItem(
-                            $"{mark}Foundry: {m.Alias}{size}", m));
+                            $"{mark}Foundry: {m.Alias}{size}  {devTag}", m));
                     }
                 });
 
@@ -349,17 +350,23 @@ namespace FoundrySTT
             }
             else
             {
-                bool cached = item.Model.Info?.Cached ?? false;
-                long sizeMb = item.Model.Info?.FileSizeMb ?? 0;
-                string sizeStr = sizeMb > 0 ? $"{sizeMb / 1024.0:F1} GB" : "unknown size";
+                bool cached      = item.Model.Info?.Cached ?? false;
+                bool alreadyLoaded = _activeModel?.Alias == item.Model.Alias;
+                long sizeMb      = item.Model.Info?.FileSizeMb ?? 0;
+                string sizeStr   = sizeMb > 0 ? $"{sizeMb / 1024.0:F1} GB" : "unknown size";
+                string devTag    = DeviceTag(item.Model);
 
-                _lblEngineInfo.Text = cached
-                    ? $"  ✓ Downloaded • {sizeStr} • chunk-based transcription"
-                    : $"  Requires download • {sizeStr} • chunk-based transcription";
+                _lblEngineInfo.Text = alreadyLoaded
+                    ? $"  ✓ Loaded • {sizeStr} • {devTag} • chunk-based transcription"
+                    : cached
+                    ? $"  ✓ Downloaded • {sizeStr} • {devTag} • click Load to activate"
+                    : $"  Requires download • {sizeStr} • {devTag} • chunk-based transcription";
 
-                _btnLoad.Enabled   = !cached && !_busy;
-                _btnLoad.Text      = cached ? "✅  Already Downloaded" : "⬇  Download & Load";
-                _btnRecord.Enabled = (cached || _activeModel?.Alias == item.Model.Alias) && !_busy;
+                _btnLoad.Text    = alreadyLoaded ? "✅  Loaded"
+                                 : cached        ? "▶  Load into Memory"
+                                                 : "⬇  Download & Load";
+                _btnLoad.Enabled   = !alreadyLoaded && !_busy;
+                _btnRecord.Enabled = alreadyLoaded && !_busy;
             }
         }
 
@@ -772,6 +779,29 @@ namespace FoundrySTT
 
         private static bool ContainsAny(string source, params string[] tokens)
             => tokens.Any(t => source.IndexOf(t, StringComparison.OrdinalIgnoreCase) >= 0);
+
+        // Returns a [GPU], [CPU], [GPU+CPU], etc. tag based on available variants.
+        private static string DeviceTag(IModel m)
+        {
+            var types = m.Variants
+                .Select(v => v.Info?.Runtime?.DeviceType ?? DeviceType.Invalid)
+                .Where(d => d != DeviceType.Invalid)
+                .Distinct()
+                .ToList();
+            if (!types.Any())
+            {
+                var own = m.Info?.Runtime?.DeviceType ?? DeviceType.Invalid;
+                if (own != DeviceType.Invalid) types.Add(own);
+            }
+            bool gpu = types.Contains(DeviceType.GPU);
+            bool npu = types.Contains(DeviceType.NPU);
+            bool cpu = types.Contains(DeviceType.CPU) || !types.Any();
+            var parts = new List<string>();
+            if (gpu) parts.Add("GPU");
+            if (npu) parts.Add("NPU");
+            if (cpu) parts.Add("CPU");
+            return $"[{string.Join("+", parts.DefaultIfEmpty("CPU"))}]";
+        }
 
         private static Color Rgb(int r, int g, int b) => Color.FromArgb(r, g, b);
 
