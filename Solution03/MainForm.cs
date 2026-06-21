@@ -47,6 +47,10 @@ namespace FoundrySTT
         private Task?                         _liveStreamTask;
         private CancellationTokenSource?      _liveCts;
 
+        // ── Whisper buffer mode (file-based transcription) ────────────────────────
+        private WaveFileWriter?               _whisperWriter;
+        private string?                       _whisperTempFile;
+
         // ── Colour palette ────────────────────────────────────────────────────────
         private static readonly Color BgDark    = Rgb(32,  33,  35);
         private static readonly Color BgPanel   = Rgb(52,  53,  65);
@@ -295,6 +299,19 @@ namespace FoundrySTT
                     foreach (ManagementObject o in q.Get())
                     { ramTotal = Convert.ToInt64(o["TotalPhysicalMemory"]); break; }
 
+                string gpu = "";
+                try
+                {
+                    using var q = new ManagementObjectSearcher(
+                        "SELECT Name FROM Win32_VideoController");
+                    foreach (ManagementObject o in q.Get())
+                    {
+                        string name = o["Name"]?.ToString()?.Trim() ?? "";
+                        if (!string.IsNullOrEmpty(name)) { gpu = name; break; }
+                    }
+                }
+                catch { /* ignore GPU detection failures */ }
+
                 SafeUI(() =>
                 {
                     _rtbHardware.Clear();
@@ -308,6 +325,8 @@ namespace FoundrySTT
                     }
                     Line("CPU:", $"{cpu}  ({cores} cores)", ColGold);
                     Line("RAM:", $"{ramTotal / (1024.0 * 1024 * 1024):F1} GB", ColGreen);
+                    if (!string.IsNullOrEmpty(gpu))
+                        Line("GPU:", gpu, Rgb(138, 180, 248));
                     Line("MIC:", $"{WaveInEvent.DeviceCount} input device(s) detected", Teal);
                 });
             }
@@ -366,6 +385,18 @@ namespace FoundrySTT
                 SafeUI(() => { _progressBar.Visible = false; _lblProgress.Text = ""; });
 
                 Status($"⏳  Loading {item.Model.Alias} into memory…");
+
+                // Prefer GPU variant if available
+                string deviceLabel = "CPU";
+                var gpuVariant = item.Model.Variants
+                    .FirstOrDefault(v => v.Info?.Runtime?.DeviceType == DeviceType.GPU);
+                if (gpuVariant != null)
+                {
+                    item.Model.SelectVariant(gpuVariant);
+                    deviceLabel = "GPU";
+                    Status($"⏳  Loading {item.Model.Alias} (GPU) into memory…");
+                }
+
                 await item.Model.LoadAsync();
 
                 // Get the SDK-native audio client — no HTTP endpoint needed
@@ -379,10 +410,10 @@ namespace FoundrySTT
                     _btnLoad.Text       = "✅  Loaded";
                     _btnLoad.Enabled    = false;
                     _btnRecord.Enabled  = true;
-                    _lblEngineInfo.Text = $"  ✓ Loaded  •  SDK native in-process inference";
+                    _lblEngineInfo.Text = $"  ✓ Loaded ({deviceLabel})  •  SDK native in-process inference";
                 });
 
-                Status($"✅  {item.Model.Alias} ready — press Record to start");
+                Status($"✅  {item.Model.Alias} ready ({deviceLabel}) — press Record to start");
             }
             catch (Exception ex)
             {
@@ -446,6 +477,51 @@ namespace FoundrySTT
                 _liveStreamTask = null;
             }
 
+            // Whisper buffer mode: finalize file and transcribe
+            if (_whisperWriter != null)
+            {
+                var writer   = _whisperWriter;
+                var tempFile = _whisperTempFile;
+                _whisperWriter   = null;
+                _whisperTempFile = null;
+
+                try
+                {
+                    writer.Flush();
+                    writer.Dispose();
+
+                    if (!string.IsNullOrEmpty(tempFile) && File.Exists(tempFile))
+                    {
+                        Status("⏳  Transcribing audio…");
+                        try
+                        {
+                            var response = await Task.Run(() =>
+                                _audioClient!.TranscribeAudioAsync(tempFile).GetAwaiter().GetResult());
+
+                            string text = response?.Text ?? "";
+                            if (!string.IsNullOrWhiteSpace(text))
+                                SafeUI(() => CommitText(text.Trim() + "\n"));
+                            else
+                                SafeUI(() => AppendSystemLine("[No speech detected]"));
+                        }
+                        catch (Exception ex)
+                        {
+                            File.AppendAllText(Program.LogFile,
+                                $"[{DateTime.Now:HH:mm:ss}] Transcription error: {ex}\n");
+                            SafeUI(() => AppendSystemLine($"[Transcription error: {ex.Message}]"));
+                        }
+                        finally
+                        {
+                            try { File.Delete(tempFile); } catch { }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    SafeUI(() => AppendSystemLine($"[Error finalizing recording: {ex.Message}]"));
+                }
+            }
+
             SafeUI(() =>
             {
                 _btnRecord.Text      = "🎤  Start Recording";
@@ -486,7 +562,12 @@ namespace FoundrySTT
             }
         }
 
-        // ── Foundry Whisper — SDK-native live transcription (no HTTP) ─────────────
+        // ── Foundry — SDK-native transcription (no HTTP) ─────────────────────────
+
+        // Returns true for Whisper-type models that do not support live streaming.
+        private bool IsWhisperModel =>
+            ContainsAny(_activeModel?.Info?.ModelType ?? "", "whisper") ||
+            ContainsAny(_activeModel?.Alias ?? "", "whisper");
 
         private async Task StartWhisperCaptureAsync(int micIndex)
         {
@@ -497,6 +578,45 @@ namespace FoundrySTT
                 return;
             }
 
+            if (IsWhisperModel)
+            {
+                // Whisper does not support live streaming; buffer audio and transcribe on stop.
+                try
+                {
+                    _whisperTempFile = Path.Combine(
+                        Path.GetTempPath(), $"foundry_stt_{Guid.NewGuid():N}.wav");
+
+                    var waveFormat = new WaveFormat(16000, 16, 1);
+                    _whisperWriter = new WaveFileWriter(_whisperTempFile, waveFormat);
+
+                    _waveIn = new WaveInEvent
+                    {
+                        DeviceNumber       = micIndex,
+                        WaveFormat         = waveFormat,
+                        BufferMilliseconds = 100
+                    };
+                    _waveIn.DataAvailable += (s, e) =>
+                    {
+                        if (_isRecording && e.BytesRecorded > 0)
+                            _whisperWriter?.Write(e.Buffer, 0, e.BytesRecorded);
+                    };
+                    _waveIn.StartRecording();
+                    SafeUI(() => AppendSystemLine("[Recording… press Stop to transcribe]"));
+                }
+                catch (Exception ex)
+                {
+                    File.AppendAllText(Program.LogFile, $"[{DateTime.Now:HH:mm:ss}] Start error: {ex}\n");
+                    SafeUI(() =>
+                    {
+                        AppendSystemLine($"[Failed to start recording: {ex.Message}]");
+                        Status($"❌  {ex.Message}");
+                    });
+                    await StopRecordingAsync();
+                }
+                return;
+            }
+
+            // Nemotron / live-streaming models
             try
             {
                 // Create and configure the live transcription session
@@ -619,6 +739,8 @@ namespace FoundrySTT
             try { _sre?.RecognizeAsyncStop(); } catch { }
             try { _waveIn?.StopRecording(); } catch { }
             try { _liveSession?.StopAsync().GetAwaiter().GetResult(); } catch { }
+            try { _whisperWriter?.Dispose(); } catch { }
+            try { if (!string.IsNullOrEmpty(_whisperTempFile)) File.Delete(_whisperTempFile); } catch { }
             _sre?.Dispose();
             _waveIn?.Dispose();
             if (FoundryLocalManager.IsInitialized)
