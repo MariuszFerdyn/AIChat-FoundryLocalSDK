@@ -436,6 +436,18 @@ namespace FoundryChatApp
                 SafeUI(() => { _progressBar.Visible = false; _btnCancel.Visible = false; _lblProgress.Text = ""; });
 
                 Status($"⏳  Loading {model.Alias} into memory…");
+
+                // Prefer GPU variant if available
+                string deviceLabel = "CPU";
+                var gpuVariant = model.Variants
+                    .FirstOrDefault(v => v.Info?.Runtime?.DeviceType == DeviceType.GPU);
+                if (gpuVariant != null)
+                {
+                    model.SelectVariant(gpuVariant);
+                    deviceLabel = "GPU";
+                    Status($"⏳  Loading {model.Alias} (GPU) into memory…");
+                }
+
                 await model.LoadAsync();
 
                 _chatClient               = await model.GetChatClientAsync();
@@ -464,8 +476,8 @@ namespace FoundryChatApp
                         _lstModels.Items[idx] = "✓" + item.Substring(1);
                 });
 
-                AppendChat("System", $"✅  Model '{model.Alias}' loaded and ready!\nYou can now type a message below.", ColSystem, italic: true);
-                Status($"✅  {model.Alias}  —  Ready");
+                AppendChat("System", $"✅  Model '{model.Alias}' loaded and ready! ({deviceLabel})\nYou can now type a message below.", ColSystem, italic: true);
+                Status($"✅  {model.Alias} ({deviceLabel})  —  Ready");
             }
             catch (OperationCanceledException)
             {
