@@ -322,21 +322,29 @@ namespace FoundryChatApp
 
                 var catalog = await FoundryLocalManager.Instance.GetCatalogAsync();
                 var models  = (await catalog.ListModelsAsync()).ToList();
-                var cached  = new HashSet<string>((await catalog.GetCachedModelsAsync()).Select(m => m.Alias));
+                var cached  = new HashSet<string>((await catalog.GetCachedModelsAsync()).Select(m => m.Id));
 
-                _models = models;
+                // Expand each model into its individual variants (GPU first, then NPU, then CPU).
+                // This lets the user explicitly pick the device they want.
+                var allVariants = models
+                    .SelectMany(m => m.Variants.Count > 0
+                        ? m.Variants.OrderBy(v => v.Info?.Runtime?.DeviceType switch
+                            { DeviceType.GPU => 0, DeviceType.NPU => 1, _ => 2 })
+                        : new List<IModel> { m })
+                    .ToList();
+
+                _models = allVariants;
 
                 SafeUI(() =>
                 {
                     _lstModels.BeginUpdate();
                     _lstModels.Items.Clear();
-                    foreach (var m in models)
+                    foreach (var m in allVariants)
                     {
-                        string cached_mark = cached.Contains(m.Alias) ? "✓" : " ";
+                        string cached_mark = cached.Contains(m.Id) ? "✓" : " ";
                         string sizePart    = m.Info?.FileSizeMb.HasValue == true
                             ? $"{m.Info.FileSizeMb.Value / 1024.0:F1} GB"
                             : "  ?  ";
-                        // Pad alias to fixed width for column alignment
                         string alias       = (m.Alias ?? "").PadRight(24);
                         string devTag      = DeviceTag(m);
                         _lstModels.Items.Add($"{cached_mark} {alias} {sizePart,7}  {devTag}");
@@ -350,7 +358,7 @@ namespace FoundryChatApp
                     }
                 });
 
-                Status($"✅  {models.Count} models available — select one and click Download & Load.");
+                Status($"✅  {allVariants.Count} model variants available — select one and click Download & Load.");
             }
             catch (Exception ex)
             {
@@ -440,16 +448,14 @@ namespace FoundryChatApp
 
                 Status($"⏳  Loading {model.Alias} into memory…");
 
-                // Prefer GPU variant if available
-                string deviceLabel = "CPU";
-                var gpuVariant = model.Variants
-                    .FirstOrDefault(v => v.Info?.Runtime?.DeviceType == DeviceType.GPU);
-                if (gpuVariant != null)
+                // The user selected the specific variant; no need to SelectVariant.
+                string deviceLabel = model.Info?.Runtime?.DeviceType switch
                 {
-                    model.SelectVariant(gpuVariant);
-                    deviceLabel = "GPU";
-                    Status($"⏳  Loading {model.Alias} (GPU) into memory…");
-                }
+                    DeviceType.GPU => "GPU",
+                    DeviceType.NPU => "NPU",
+                    _              => "CPU"
+                };
+                Status($"⏳  Loading {model.Alias} ({deviceLabel}) into memory…");
 
                 await model.LoadAsync();
 

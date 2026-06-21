@@ -226,12 +226,20 @@ namespace FoundrySTT
                 var catalog = await FoundryLocalManager.Instance.GetCatalogAsync();
                 var all     = (await catalog.ListModelsAsync()).ToList();
 
-                // Look for transcription / ASR / Whisper models
-                _transcriptionModels = all.Where(m =>
+                // Look for transcription / ASR / Whisper/Nemotron models
+                var matchingModels = all.Where(m =>
                     ContainsAny(m.Info?.Task    ?? "", "transcri", "speech", "asr", "whisper") ||
-                    ContainsAny(m.Alias         ?? "", "whisper") ||
+                    ContainsAny(m.Alias         ?? "", "whisper", "nemotron") ||
                     ContainsAny(m.Info?.DisplayName ?? "", "whisper", "transcri")
                 ).ToList();
+
+                // Expand each model into its individual variants (GPU first, then NPU, then CPU).
+                _transcriptionModels = matchingModels
+                    .SelectMany(m => m.Variants.Count > 0
+                        ? m.Variants.OrderBy(v => v.Info?.Runtime?.DeviceType switch
+                            { DeviceType.GPU => 0, DeviceType.NPU => 1, _ => 2 })
+                        : new List<IModel> { m })
+                    .ToList();
 
                 SafeUI(() =>
                 {
@@ -248,7 +256,7 @@ namespace FoundrySTT
                 });
 
                 string note = _transcriptionModels.Count > 0
-                    ? $"✅  Ready — {_transcriptionModels.Count} Foundry transcription model(s) found"
+                    ? $"✅  Ready — {_transcriptionModels.Count} Foundry model variant(s) found"
                     : "✅  Ready — no Foundry transcription models in catalog; using Windows STT";
                 Status(note);
             }
@@ -393,16 +401,14 @@ namespace FoundrySTT
 
                 Status($"⏳  Loading {item.Model.Alias} into memory…");
 
-                // Prefer GPU variant if available
-                string deviceLabel = "CPU";
-                var gpuVariant = item.Model.Variants
-                    .FirstOrDefault(v => v.Info?.Runtime?.DeviceType == DeviceType.GPU);
-                if (gpuVariant != null)
+                // The user selected the specific variant; derive device label from its Runtime.
+                string deviceLabel = item.Model.Info?.Runtime?.DeviceType switch
                 {
-                    item.Model.SelectVariant(gpuVariant);
-                    deviceLabel = "GPU";
-                    Status($"⏳  Loading {item.Model.Alias} (GPU) into memory…");
-                }
+                    DeviceType.GPU => "GPU",
+                    DeviceType.NPU => "NPU",
+                    _              => "CPU"
+                };
+                Status($"⏳  Loading {item.Model.Alias} ({deviceLabel}) into memory…");
 
                 await item.Model.LoadAsync();
 
