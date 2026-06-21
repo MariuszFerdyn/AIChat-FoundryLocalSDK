@@ -236,7 +236,7 @@ namespace FoundrySTT
                 // Expand each model into its individual variants (GPU first, then NPU, then CPU).
                 _transcriptionModels = matchingModels
                     .SelectMany(m => m.Variants.Count > 0
-                        ? m.Variants.OrderBy(v => v.Info?.Runtime?.DeviceType switch
+                        ? (IEnumerable<IModel>)m.Variants.OrderBy(v => v.Info?.Runtime?.DeviceType switch
                             { DeviceType.GPU => 0, DeviceType.NPU => 1, _ => 2 })
                         : new List<IModel> { m })
                     .ToList();

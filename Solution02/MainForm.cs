@@ -328,7 +328,7 @@ namespace FoundryChatApp
                 // This lets the user explicitly pick the device they want.
                 var allVariants = models
                     .SelectMany(m => m.Variants.Count > 0
-                        ? m.Variants.OrderBy(v => v.Info?.Runtime?.DeviceType switch
+                        ? (IEnumerable<IModel>)m.Variants.OrderBy(v => v.Info?.Runtime?.DeviceType switch
                             { DeviceType.GPU => 0, DeviceType.NPU => 1, _ => 2 })
                         : new List<IModel> { m })
                     .ToList();
