@@ -27,6 +27,8 @@ namespace FoundryChatApp
         private readonly TextBox        _txtInput;
         private readonly Button         _btnSend;
         private readonly Label          _lblStatus;
+        private Button                  _btnClearCache = null!;
+        private readonly ToolTip        _toolTip;
 
         // ── State ─────────────────────────────────────────────────────────────────
         private List<IModel>            _models      = new List<IModel>();
@@ -35,6 +37,21 @@ namespace FoundryChatApp
         private readonly List<ChatMessage> _history  = new List<ChatMessage>();
         private CancellationTokenSource? _cts;
         private bool                    _busy;
+        private bool                    _generating;
+
+        // ── Chat sessions ─────────────────────────────────────────────────────────
+        private sealed class ChatSession
+        {
+            public string Name { get; set; } = "New Chat";
+            public string ModelAlias { get; set; } = "Assistant";
+            public List<ChatMessage> History { get; set; } = new List<ChatMessage>();
+        }
+        private readonly List<ChatSession> _sessions = new List<ChatSession>();
+        private int                        _sessionIdx = -1;
+
+        // ── Chat history panel controls ───────────────────────────────────────────
+        private ListBox  _lstChats   = null!;
+        private Button   _btnNewChat = null!;
 
         // ── Palette ───────────────────────────────────────────────────────────────
         private static readonly Color BgDark       = Rgb(32,  33,  35);
@@ -63,6 +80,7 @@ namespace FoundryChatApp
             BackColor       = BgDark;
             ForeColor       = Color.White;
             Font            = new Font("Segoe UI", 10F);
+            _toolTip        = new ToolTip();
 
             // ── LEFT PANEL ─────────────────────────────────────────────────────────
             var left = MakePanel(DockStyle.Left, BgPanel, width: 340);
@@ -75,7 +93,7 @@ namespace FoundryChatApp
             _rtbHardware = new RichTextBox
             {
                 Dock        = DockStyle.Top,
-                Height      = 118,
+                Height      = 148,
                 BackColor   = BgList,
                 ForeColor   = TextBright,
                 BorderStyle = BorderStyle.None,
@@ -84,6 +102,10 @@ namespace FoundryChatApp
                 ScrollBars  = RichTextBoxScrollBars.None,
                 Text        = "  Detecting hardware…"
             };
+
+            _btnClearCache = MakeButton("🗑  Clear Model Cache", Rgb(70, 50, 50), DockStyle.Top, height: 26);
+            _btnClearCache.Font = new Font("Segoe UI", 8F, FontStyle.Bold);
+            _btnClearCache.Click += OnClearCacheClick;
 
             var hwSep = new Panel { Dock = DockStyle.Top, Height = 6, BackColor = BgPanel };
 
@@ -133,6 +155,7 @@ namespace FoundryChatApp
             _btnCancel = MakeButton("✕  Cancel", Rgb(140, 60, 60), DockStyle.Top, height: 30);
             _btnCancel.Visible = false;
             _btnCancel.Click  += (_, __) => _cts?.Cancel();
+            _toolTip.SetToolTip(_btnCancel, "Cancel current download or generation");
 
             foot.Controls.Add(_lblProgress);
             foot.Controls.Add(_progressBar);
@@ -145,6 +168,7 @@ namespace FoundryChatApp
             left.Controls.Add(_lblModelInfo);
             left.Controls.Add(titleLabel);
             left.Controls.Add(hwSep);
+            left.Controls.Add(_btnClearCache);
             left.Controls.Add(_rtbHardware);
             left.Controls.Add(hwTitle);
 
@@ -169,13 +193,24 @@ namespace FoundryChatApp
                 Padding     = new Padding(12)
             };
 
-            var inputRow = MakePanel(DockStyle.Bottom, BgInput, height: 56);
+            var inputRow = MakePanel(DockStyle.Bottom, BgInput, height: 80);
             inputRow.Padding = new Padding(10, 8, 8, 8);
+
+            var inputHint = new Label
+            {
+                Text      = "  Enter = send  •  Shift+Enter = new line",
+                Dock      = DockStyle.Bottom,
+                Height    = 18,
+                BackColor = BgDark,
+                ForeColor = TextDim,
+                Font      = new Font("Segoe UI", 8F)
+            };
 
             _btnSend = MakeButton("➤", Teal, DockStyle.Right, width: 56);
             _btnSend.Font    = new Font("Segoe UI", 13F);
             _btnSend.Enabled = false;
             _btnSend.Click  += async (_, __) => await SendAsync();
+            _toolTip.SetToolTip(_btnSend, "Send message");
 
             _txtInput = new TextBox
             {
@@ -184,7 +219,10 @@ namespace FoundryChatApp
                 ForeColor   = Color.White,
                 BorderStyle = BorderStyle.None,
                 Font        = new Font("Segoe UI", 11F),
-                Enabled     = false
+                Enabled     = false,
+                Multiline   = true,
+                AcceptsReturn = true,
+                ScrollBars  = ScrollBars.Vertical
             };
             _txtInput.KeyDown += async (_, e) =>
             {
@@ -193,6 +231,7 @@ namespace FoundryChatApp
                     e.SuppressKeyPress = true;
                     await SendAsync();
                 }
+                // Shift+Enter inserts a newline (handled by default for multiline TextBox)
             };
 
             inputRow.Controls.Add(_txtInput);
@@ -200,6 +239,7 @@ namespace FoundryChatApp
 
             right.Controls.Add(_rtbChat);
             right.Controls.Add(inputRow);
+            right.Controls.Add(inputHint);
             right.Controls.Add(_lblStatus);
 
             // ── SPLITTER ────────────────────────────────────────────────────────────
@@ -210,7 +250,42 @@ namespace FoundryChatApp
                 BackColor = Rgb(80, 81, 95)
             };
 
+            // ── HISTORY PANEL (right side) ─────────────────────────────────────────────
+            var histPanel = MakePanel(DockStyle.Right, BgPanel, width: 180);
+            histPanel.Padding = new Padding(4, 6, 4, 4);
+
+            var histTitle = MakeLabel("💬  Chats", DockStyle.Top, 26, bold: true);
+
+            _btnNewChat = MakeButton("＋  New Chat", Teal, DockStyle.Top, height: 32);
+            _btnNewChat.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+            _btnNewChat.Click += OnNewChat;
+
+            _lstChats = new ListBox
+            {
+                Dock          = DockStyle.Fill,
+                BackColor     = BgList,
+                ForeColor     = TextBright,
+                BorderStyle   = BorderStyle.None,
+                Font          = new Font("Segoe UI", 9F),
+                SelectionMode = SelectionMode.One,
+                ItemHeight    = 24
+            };
+            _lstChats.SelectedIndexChanged += OnChatSelected;
+
+            histPanel.Controls.Add(_lstChats);
+            histPanel.Controls.Add(_btnNewChat);
+            histPanel.Controls.Add(histTitle);
+
+            var histSplitter = new Splitter
+            {
+                Dock      = DockStyle.Right,
+                Width     = 3,
+                BackColor = Rgb(80, 81, 95)
+            };
+
             Controls.Add(right);
+            Controls.Add(histSplitter);
+            Controls.Add(histPanel);
             Controls.Add(splitter);
             Controls.Add(left);
 
@@ -298,6 +373,27 @@ namespace FoundryChatApp
                 Line("GPU:", gpu, Rgb(140, 180, 255));
 
             Line("EPs:", epLine, Teal);
+
+            string cachePath = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".FoundryChatApp", "cache", "models");
+            long cacheBytes = 0;
+            if (System.IO.Directory.Exists(cachePath))
+            {
+                try
+                {
+                    cacheBytes = new System.IO.DirectoryInfo(cachePath)
+                        .GetFiles("*", System.IO.SearchOption.AllDirectories)
+                        .Sum(f => f.Length);
+                }
+                catch { }
+            }
+            string cacheInfo = System.IO.Directory.Exists(cachePath)
+                ? (cacheBytes > 1024L * 1024 * 1024
+                    ? $"{cacheBytes / (1024.0 * 1024 * 1024):F1} GB used"
+                    : $"{cacheBytes / (1024.0 * 1024):F0} MB used")
+                : "(empty)";
+            Line("📦:", $"{cacheInfo}", TextDim);
         }
 
         // ── Initialisation ────────────────────────────────────────────────────────
@@ -318,7 +414,7 @@ namespace FoundryChatApp
                 // Register all available EPs (GPU/NPU/DirectML) so the catalog
                 // includes hardware-accelerated model variants.
                 // Without this, only CPU models appear.
-                Status("🔌  Registering execution providers (GPU/NPU)…");
+                Status("🔌  Registering execution providers (GPU/NPU) — CUDA registration may take several minutes, please wait…");
                 try
                 {
                     string curEp = "";
@@ -427,6 +523,12 @@ namespace FoundryChatApp
 
         private async void OnDownloadClick(object? sender, EventArgs e)
         {
+            if (_generating)
+            {
+                Status("⚠  Cancel the current response before loading a different model");
+                return;
+            }
+
             int idx = _lstModels.SelectedIndex;
             if (idx < 0 || idx >= _models.Count) return;
 
@@ -464,8 +566,6 @@ namespace FoundryChatApp
 
                 SafeUI(() => { _progressBar.Visible = false; _btnCancel.Visible = false; _lblProgress.Text = ""; });
 
-                Status($"⏳  Loading {model.Alias} into memory…");
-
                 // The user selected the specific variant; no need to SelectVariant.
                 string deviceLabel = model.Info?.Runtime?.DeviceType switch
                 {
@@ -473,7 +573,7 @@ namespace FoundryChatApp
                     DeviceType.NPU => "NPU",
                     _              => "CPU"
                 };
-                Status($"⏳  Loading {model.Alias} ({deviceLabel}) into memory…");
+                Status($"⏳  Loading {model.Alias} ({deviceLabel}) into memory… (may take a minute for large models)");
 
                 await model.LoadAsync();
 
@@ -484,6 +584,8 @@ namespace FoundryChatApp
 
                 _activeModel = model;
 
+                SaveCurrentSession();
+
                 // Reset conversation
                 _history.Clear();
                 _history.Add(new ChatMessage
@@ -491,6 +593,42 @@ namespace FoundryChatApp
                     Role    = "system",
                     Content = "You are a helpful, friendly, and knowledgeable AI assistant."
                 });
+
+                // Initialize first chat session if none exist
+                if (_sessions.Count == 0)
+                {
+                    var firstSession = new ChatSession
+                    {
+                        Name = "Chat 1",
+                        ModelAlias = model.Alias ?? "Assistant"
+                    };
+                    firstSession.History.AddRange(_history);
+                    _sessions.Add(firstSession);
+                    _sessionIdx = 0;
+                    SafeUI(() =>
+                    {
+                        _lstChats.Items.Clear();
+                        _lstChats.Items.Add("Chat 1");
+                        _lstChats.SelectedIndex = 0;
+                    });
+                }
+                else
+                {
+                    // Start fresh session
+                    var newSession = new ChatSession
+                    {
+                        Name = "New Chat",
+                        ModelAlias = model.Alias ?? "Assistant"
+                    };
+                    newSession.History.AddRange(_history);
+                    _sessions.Add(newSession);
+                    _sessionIdx = _sessions.Count - 1;
+                    SafeUI(() =>
+                    {
+                        _lstChats.Items.Add("New Chat");
+                        _lstChats.SelectedIndex = _lstChats.Items.Count - 1;
+                    });
+                }
 
                 SafeUI(() =>
                 {
@@ -530,6 +668,109 @@ namespace FoundryChatApp
 
         // ── Chat ──────────────────────────────────────────────────────────────────
 
+        private void OnNewChat(object? sender, EventArgs e)
+        {
+            if (_generating)
+            {
+                Status("⚠  Cancel the current response before starting a new chat");
+                return;
+            }
+
+            // Save current chat to session (if it has messages beyond system)
+            SaveCurrentSession();
+
+            // Create new session
+            var session = new ChatSession
+            {
+                Name = "New Chat",
+                ModelAlias = _activeModel?.Alias ?? "Assistant"
+            };
+            session.History.Add(new ChatMessage
+            {
+                Role    = "system",
+                Content = "You are a helpful, friendly, and knowledgeable AI assistant."
+            });
+            _sessions.Add(session);
+            _sessionIdx = _sessions.Count - 1;
+
+            // Update list
+            SafeUI(() =>
+            {
+                _lstChats.Items.Add("New Chat");
+                _lstChats.SelectedIndex = _lstChats.Items.Count - 1;
+            });
+
+            // Clear current chat display and reset history
+            _history.Clear();
+            _history.Add(new ChatMessage
+            {
+                Role    = "system",
+                Content = "You are a helpful, friendly, and knowledgeable AI assistant."
+            });
+            SafeUI(() => _rtbChat.Clear());
+            Status($"✅  {_activeModel?.Alias ?? "No model loaded"}  —  New chat started");
+        }
+
+        private void OnChatSelected(object? sender, EventArgs e)
+        {
+            if (_generating)
+            {
+                Status("⚠  Cancel the current response before switching chats");
+                if (_sessionIdx >= 0 && _sessionIdx < _lstChats.Items.Count)
+                    SafeUI(() => _lstChats.SelectedIndex = _sessionIdx);
+                return;
+            }
+
+            int idx = _lstChats.SelectedIndex;
+            if (idx < 0 || idx >= _sessions.Count || idx == _sessionIdx) return;
+
+            // Save current session
+            SaveCurrentSession();
+
+            // Load selected session
+            _sessionIdx = idx;
+            var session = _sessions[idx];
+            const string assistantName = "Assistant";
+
+            _history.Clear();
+            _history.AddRange(session.History);
+
+            // Rebuild chat display from history
+            SafeUI(() =>
+            {
+                _rtbChat.Clear();
+                foreach (var msg in _history)
+                {
+                    if (msg.Role == "user")
+                        AppendChat("You", msg.Content ?? "", ColYou);
+                    else if (msg.Role == "assistant")
+                        AppendChat(assistantName, msg.Content ?? "", ColAi);
+                }
+            });
+            Status($"✅  {_activeModel?.Alias ?? assistantName}  —  Chat loaded");
+        }
+
+        private void SaveCurrentSession()
+        {
+            if (_sessionIdx >= 0 && _sessionIdx < _sessions.Count)
+            {
+                _sessions[_sessionIdx].History = new List<ChatMessage>(_history);
+                // Auto-name from first user message
+                var firstUser = _history.FirstOrDefault(m => m.Role == "user");
+                if (firstUser != null)
+                {
+                    string name = firstUser.Content ?? "Chat";
+                    if (name.Length > 25) name = name.Substring(0, 22) + "…";
+                    _sessions[_sessionIdx].Name = name;
+                    SafeUI(() =>
+                    {
+                        if (_sessionIdx < _lstChats.Items.Count)
+                            _lstChats.Items[_sessionIdx] = name;
+                    });
+                }
+            }
+        }
+
         private async Task SendAsync()
         {
             string text = _txtInput.Text.Trim();
@@ -540,41 +781,196 @@ namespace FoundryChatApp
                 _txtInput.Clear();
                 _txtInput.Enabled = false;
                 _btnSend.Enabled  = false;
+                _btnNewChat.Enabled = false;
+                _lstChats.Enabled = false;
+                _btnDownload.Enabled = false;
+                _lstModels.Enabled = false;
+                _btnCancel.Visible = true;
+                _lblProgress.Text = "Generating…";
             });
+            _toolTip.SetToolTip(_btnSend, "Generating… use Cancel to stop.");
 
             Status("⏳  Thinking…");
             AppendChat("You", text, ColYou);
             _history.Add(new ChatMessage { Role = "user", Content = text });
-
-            // Keep history manageable: system message + last 20 turns max
             TrimHistory(20);
+            SaveCurrentSession();
+
+            _cts = new CancellationTokenSource();
+            _generating = true;
 
             try
             {
-                // Pass CancellationToken.None to avoid any accidental timeout from a shared token
-                var response = await _chatClient.CompleteChatAsync(_history.ToArray(), (System.Threading.CancellationToken?)System.Threading.CancellationToken.None);
-                string reply = response?.Choices?[0]?.Message?.Content ?? "(no response)";
+                // Streaming: display tokens as they arrive — avoids timeout on long prompts
+                var sb = new System.Text.StringBuilder();
+                bool headerWritten = false;
 
-                _history.Add(new ChatMessage { Role = "assistant", Content = reply });
-                AppendChat(_activeModel?.Alias ?? "Assistant", reply, ColAi);
+                await foreach (var chunk in _chatClient.CompleteChatStreamingAsync(_history.ToArray(), _cts.Token))
+                {
+                    string content = chunk.Choices?.Count > 0
+                        ? (chunk.Choices[0].Message?.Content ?? chunk.Choices[0].Delta?.Content ?? string.Empty)
+                        : string.Empty;
+                    if (string.IsNullOrEmpty(content)) continue;
+
+                    if (!headerWritten)
+                    {
+                        // Write the sender header once
+                        SafeUI(() =>
+                        {
+                            _rtbChat.SelectionStart = _rtbChat.TextLength;
+                            _rtbChat.SelectionColor = ColAi;
+                            _rtbChat.SelectionFont  = new Font("Segoe UI", 10F, FontStyle.Bold);
+                            _rtbChat.AppendText($"\n{_activeModel?.Alias ?? "Assistant"}\n");
+                        });
+                        headerWritten = true;
+                    }
+
+                    sb.Append(content);
+                    SafeUI(() =>
+                    {
+                        _rtbChat.SelectionStart = _rtbChat.TextLength;
+                        _rtbChat.SelectionColor = TextBright;
+                        _rtbChat.SelectionFont  = new Font("Segoe UI", 11F, FontStyle.Regular);
+                        _rtbChat.AppendText(content);
+                        _rtbChat.ScrollToCaret();
+                    });
+                }
+
+                string fullReply = sb.Length > 0 ? sb.ToString() : "(no response)";
+
+                if (!headerWritten)
+                {
+                    SafeUI(() =>
+                    {
+                        _rtbChat.SelectionStart = _rtbChat.TextLength;
+                        _rtbChat.SelectionColor = ColAi;
+                        _rtbChat.SelectionFont  = new Font("Segoe UI", 10F, FontStyle.Bold);
+                        _rtbChat.AppendText($"\n{_activeModel?.Alias ?? "Assistant"}\n");
+                        _rtbChat.SelectionColor = TextBright;
+                        _rtbChat.SelectionFont  = new Font("Segoe UI", 11F, FontStyle.Regular);
+                        _rtbChat.AppendText(fullReply);
+                    });
+                }
+
+                // Write separator after complete response
+                SafeUI(() =>
+                {
+                    _rtbChat.SelectionStart = _rtbChat.TextLength;
+                    _rtbChat.SelectionColor = Separator;
+                    _rtbChat.SelectionFont  = new Font("Segoe UI", 8F);
+                    _rtbChat.AppendText("\n─────────────────────────────────────────────────────\n");
+                    _rtbChat.ScrollToCaret();
+                });
+
+                _history.Add(new ChatMessage { Role = "assistant", Content = fullReply });
+                SaveCurrentSession();
                 Status($"✅  {_activeModel?.Alias}  —  Ready");
+            }
+            catch (OperationCanceledException)
+            {
+                if (_history.Count > 0
+                    && string.Equals(_history[_history.Count - 1].Role, "user", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(_history[_history.Count - 1].Content, text, StringComparison.Ordinal))
+                {
+                    _history.RemoveAt(_history.Count - 1);
+                    SaveCurrentSession();
+                }
+
+                SafeUI(() =>
+                {
+                    _rtbChat.SelectionStart = _rtbChat.TextLength;
+                    _rtbChat.SelectionColor = ColSystem;
+                    _rtbChat.SelectionFont  = new Font("Segoe UI", 10F, FontStyle.Italic);
+                    _rtbChat.AppendText("\n(cancelled)\n─────────────────────────────────────────────────────\n");
+                });
+                Status("⚠  Cancelled");
             }
             catch (Exception ex)
             {
-                // Write full details to log for debugging
+                if (_history.Count > 0
+                    && string.Equals(_history[_history.Count - 1].Role, "user", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(_history[_history.Count - 1].Content, text, StringComparison.Ordinal))
+                {
+                    _history.RemoveAt(_history.Count - 1);
+                    SaveCurrentSession();
+                }
+
                 string detail = $"[{DateTime.Now:HH:mm:ss}] SendAsync error:\n{ex}\n\n";
                 System.IO.File.AppendAllText(Program.LogFile, detail);
-                AppendChat("Error", ex.Message, ColError);
+
+                bool isOom = ex.Message.IndexOf("memory", StringComparison.OrdinalIgnoreCase) >= 0
+                          || ex.Message.IndexOf("OOM", StringComparison.OrdinalIgnoreCase) >= 0
+                          || ex.Message.IndexOf("allocat", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                SafeUI(() =>
+                {
+                    _rtbChat.SelectionStart = _rtbChat.TextLength;
+                    _rtbChat.SelectionColor = ColError;
+                    _rtbChat.SelectionFont  = new Font("Segoe UI", 11F, isOom ? FontStyle.Bold : FontStyle.Regular);
+                    string label = isOom ? "\n⚠  OUT OF MEMORY — GPU/RAM exhausted\n" : $"\nError\n{ex.Message}\n";
+                    _rtbChat.AppendText(label);
+                    if (isOom)
+                    {
+                        _rtbChat.SelectionColor = TextDim;
+                        _rtbChat.SelectionFont  = new Font("Segoe UI", 9F, FontStyle.Italic);
+                        _rtbChat.AppendText("Tip: Use shorter prompts, start a New Chat, or load a smaller/CPU model.\n");
+                    }
+                    _rtbChat.SelectionColor = Separator;
+                    _rtbChat.SelectionFont  = new Font("Segoe UI", 8F);
+                    _rtbChat.AppendText("─────────────────────────────────────────────────────\n");
+                    _rtbChat.ScrollToCaret();
+                });
                 Status("❌  Error — see error.log for details");
             }
             finally
             {
+                _generating = false;
+                _cts = null;
+                _toolTip.SetToolTip(_btnSend, "Send message");
                 SafeUI(() =>
                 {
                     _txtInput.Enabled = true;
                     _btnSend.Enabled  = true;
+                    _btnNewChat.Enabled = true;
+                    _lstChats.Enabled = true;
+                    _btnDownload.Enabled = !_busy && _lstModels.SelectedIndex >= 0;
+                    _lstModels.Enabled = !_busy;
+                    _btnCancel.Visible = false;
+                    _lblProgress.Text = "";
                     _txtInput.Focus();
                 });
+            }
+        }
+
+        private void OnClearCacheClick(object? sender, EventArgs e)
+        {
+            string cachePath = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".FoundryChatApp", "cache", "models");
+            if (!System.IO.Directory.Exists(cachePath))
+            {
+                MessageBox.Show("Model cache directory does not exist:\n" + cachePath,
+                    "Clear Cache", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (MessageBox.Show(
+                $"Delete all cached models from:\n{cachePath}\n\nYou will need to re-download models.",
+                "Clear Model Cache", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                return;
+            try
+            {
+                foreach (var d in new System.IO.DirectoryInfo(cachePath).GetDirectories())
+                    d.Delete(true);
+                foreach (var f in new System.IO.DirectoryInfo(cachePath).GetFiles())
+                    f.Delete();
+                MessageBox.Show("Model cache cleared.", "Clear Cache",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                Task.Run(() => LoadHardwareInfo());
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error clearing cache: {ex.Message}", "Clear Cache",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -584,7 +980,11 @@ namespace FoundryChatApp
             // Each turn = 2 messages (user + assistant); trim oldest pairs
             int maxMessages = 1 + maxTurns * 2;
             while (_history.Count > maxMessages)
-                _history.RemoveAt(1); // remove oldest after system msg
+            {
+                _history.RemoveAt(1); // remove oldest user after system msg
+                if (_history.Count > 1 && string.Equals(_history[1].Role, "assistant", StringComparison.OrdinalIgnoreCase))
+                    _history.RemoveAt(1);
+            }
         }
 
         // ── UI helpers ────────────────────────────────────────────────────────────

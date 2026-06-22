@@ -4,7 +4,6 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Management;
-using System.Speech.Recognition;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -29,6 +28,7 @@ namespace FoundrySTT
         private readonly RichTextBox  _rtbTranscript;
         private readonly Button       _btnRecord;
         private readonly Button       _btnClear;
+        private readonly Button       _btnClearCache;
         private readonly Label        _lblStatus;
 
         // ── State ─────────────────────────────────────────────────────────────────
@@ -37,8 +37,6 @@ namespace FoundrySTT
         private bool                  _isRecording;
         private bool                  _busy;
 
-        // ── Windows STT ───────────────────────────────────────────────────────────
-        private SpeechRecognitionEngine? _sre;
         private int                   _interimStart = -1;
 
         // ── NAudio / Foundry Whisper (SDK native, no HTTP) ────────────────────────
@@ -51,9 +49,17 @@ namespace FoundrySTT
         private Channel<byte[]>?              _audioChannel;
         private Task?                         _appendTask;
 
-        // ── Whisper buffer mode (file-based transcription) ────────────────────────
+        // ── Whisper chunked mode (file-based transcription) ───────────────────────
         private WaveFileWriter?               _whisperWriter;
         private string?                       _whisperTempFile;
+        // Real-time chunked Whisper transcription
+        private const int WavSampleRate = 16000;
+        private const int WavBytesPerSample = 2; // 16-bit mono
+        private const int ChunkSeconds = 4;
+        private const int ChunkBytes = WavSampleRate * WavBytesPerSample * ChunkSeconds; // 128000 bytes = 4s
+        private int                           _whisperChunkAccum;   // bytes accumulated in current chunk
+        private Channel<string>?              _whisperChunkQueue;   // channel of temp WAV file paths to transcribe
+        private Task?                         _whisperChunkTask;    // consumer task that transcribes queued files
 
         // ── Colour palette ────────────────────────────────────────────────────────
         private static readonly Color BgDark    = Rgb(32,  33,  35);
@@ -88,12 +94,15 @@ namespace FoundrySTT
             var hwTitle = MakeLabel("🖥  Hardware", DockStyle.Top, 28, bold: true);
             _rtbHardware = new RichTextBox
             {
-                Dock = DockStyle.Top, Height = 82,
+                Dock = DockStyle.Top, Height = 110,
                 BackColor = BgList, ForeColor = TextBright,
                 BorderStyle = BorderStyle.None, ReadOnly = true,
                 Font = new Font("Consolas", 9F), ScrollBars = RichTextBoxScrollBars.None,
                 Text = "  Detecting hardware…"
             };
+            _btnClearCache = MakeButton("🗑  Clear Model Cache", Rgb(80, 60, 60), DockStyle.Top, height: 26);
+            _btnClearCache.Font = new Font("Segoe UI", 8F, FontStyle.Bold);
+            _btnClearCache.Click += OnClearCacheClick;
 
             // Microphone
             var sep1 = new Panel { Dock = DockStyle.Top, Height = 8, BackColor = BgPanel };
@@ -158,6 +167,7 @@ namespace FoundrySTT
             left.Controls.Add(_cmbMic);
             left.Controls.Add(micTitle);
             left.Controls.Add(sep1);
+            left.Controls.Add(_btnClearCache);
             left.Controls.Add(_rtbHardware);
             left.Controls.Add(hwTitle);
 
@@ -215,10 +225,6 @@ namespace FoundrySTT
             await Task.Run(() => LoadHardwareInfo());
             LoadMicrophones();
 
-            // Windows Speech Recognition is always available
-            SafeUI(() => _cmbEngine.Items.Add(new EngineItem(
-                "Windows Speech Recognition  (built-in, near-realtime)", null)));
-
             try
             {
                 Status("⏳  Starting Foundry Local…");
@@ -229,7 +235,7 @@ namespace FoundrySTT
                 // Register all available EPs (GPU/NPU/DirectML) so the catalog
                 // includes hardware-accelerated model variants.
                 // Without this, only CPU models appear in the catalog.
-                Status("🔌  Registering execution providers (GPU/NPU)…");
+                Status("🔌  Registering execution providers (GPU/NPU) — CUDA registration may take several minutes, please wait…");
                 try
                 {
                     string curEp = "";
@@ -282,13 +288,13 @@ namespace FoundrySTT
 
                 string note = _transcriptionModels.Count > 0
                     ? $"✅  Ready — {_transcriptionModels.Count} Foundry model variant(s) found"
-                    : "✅  Ready — no Foundry transcription models in catalog; using Windows STT";
+                    : "✅  Ready — no Foundry transcription models in catalog";
                 Status(note);
             }
             catch (Exception ex)
             {
                 File.AppendAllText(Program.LogFile, ex + Environment.NewLine);
-                Status("⚠  Foundry Local unavailable — using Windows Speech Recognition");
+                Status("⚠  Foundry Local unavailable");
             }
             finally
             {
@@ -355,6 +361,10 @@ namespace FoundrySTT
                 }
                 catch { /* ignore GPU detection failures */ }
 
+                string cachePath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".FoundrySTT", "cache", "models");
+
                 SafeUI(() =>
                 {
                     _rtbHardware.Clear();
@@ -371,6 +381,25 @@ namespace FoundrySTT
                     if (!string.IsNullOrEmpty(gpu))
                         Line("GPU:", gpu, Rgb(138, 180, 248));
                     Line("MIC:", $"{WaveInEvent.DeviceCount} input device(s) detected", Teal);
+                    if (Directory.Exists(cachePath))
+                    {
+                        long cacheSize = 0;
+                        try
+                        {
+                            cacheSize = new DirectoryInfo(cachePath)
+                                .GetFiles("*", SearchOption.AllDirectories)
+                                .Sum(f => f.Length);
+                        }
+                        catch { }
+                        string sizeStr = cacheSize > 1024L * 1024 * 1024
+                            ? $"{cacheSize / (1024.0 * 1024 * 1024):F1} GB"
+                            : $"{cacheSize / (1024.0 * 1024):F0} MB";
+                        Line("📦 Cache:", $"{sizeStr}  at {cachePath}", TextDim);
+                    }
+                    else
+                    {
+                        Line("📦 Cache:", cachePath, TextDim);
+                    }
                 });
             }
             catch { SafeUI(() => _rtbHardware.Text = "  Hardware info unavailable"); }
@@ -385,10 +414,9 @@ namespace FoundrySTT
 
             if (item.Model == null)
             {
-                // Windows STT — always ready
-                _lblEngineInfo.Text = "  Real-time word-by-word • uses Windows default mic";
+                _lblEngineInfo.Text = "  Select and load a Foundry transcription model";
                 _btnLoad.Enabled    = false;
-                _btnRecord.Enabled  = !_busy;
+                _btnRecord.Enabled  = false;
             }
             else
             {
@@ -483,6 +511,22 @@ namespace FoundrySTT
             var item     = _cmbEngine.SelectedItem as EngineItem;
             int micIndex = (_cmbMic.SelectedItem as MicItem)?.DeviceIndex ?? 0;
 
+            if (item?.Model == null)
+            {
+                _isRecording = false;
+                SafeUI(() =>
+                {
+                    _btnRecord.Text      = "🎤  Start Recording";
+                    _btnRecord.BackColor = Teal;
+                    _cmbEngine.Enabled   = true;
+                    _cmbMic.Enabled      = true;
+                });
+                Status("❌  No model selected — select and load a model first");
+                MessageBox.Show("No model selected — select and load a model first", "Record Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
             _isRecording = true;
             SafeUI(() =>
             {
@@ -492,10 +536,7 @@ namespace FoundrySTT
                 _cmbMic.Enabled      = false;
             });
 
-            if (item?.Model == null)
-                await Task.Run(() => StartWindowsStt());          // Windows STT
-            else
-                await StartWhisperCaptureAsync(micIndex);         // Foundry SDK native
+            await StartWhisperCaptureAsync(micIndex);             // Foundry SDK native
 
             Status("🔴  Recording…  speak now");
         }
@@ -514,9 +555,6 @@ namespace FoundrySTT
                 _cmbMic.Enabled      = true;
             });
             Status("⏸  Stopping…");
-
-            // Stop Windows STT
-            try { _sre?.RecognizeAsyncStop(); } catch { }
 
             // Stop microphone capture
             try { _waveIn?.StopRecording(); } catch { }
@@ -547,86 +585,48 @@ namespace FoundrySTT
                 _liveStreamTask = null;
             }
 
-            // Whisper buffer mode: finalize file and transcribe (streaming for progressive display)
-            if (_whisperWriter != null)
+            // Whisper chunked mode: finalize last partial chunk and wait for transcription queue to drain
+            if (_whisperWriter != null || _whisperChunkQueue != null)
             {
-                var writer   = _whisperWriter;
-                var tempFile = _whisperTempFile;
-                _whisperWriter   = null;
-                _whisperTempFile = null;
-
-                try
+                // Finalize the current (possibly partial) chunk if it has enough audio (> 0.5s)
+                if (_whisperWriter != null && _whisperChunkAccum > WavSampleRate * WavBytesPerSample / 2)
                 {
-                    writer.Flush();
-                    writer.Dispose();
-
-                    if (!string.IsNullOrEmpty(tempFile) && File.Exists(tempFile))
+                    var lastPath = _whisperTempFile!;
+                    _whisperWriter.Flush();
+                    _whisperWriter.Dispose();
+                    _whisperWriter = null;
+                    _whisperTempFile = null;
+                    _whisperChunkQueue?.Writer.TryWrite(lastPath);
+                }
+                else
+                {
+                    // Discard tiny/empty last chunk
+                    if (_whisperWriter != null)
                     {
-                        Status("⏳  Transcribing audio…");
-                        try
-                        {
-                            bool gotText = false;
-                            var response = _audioClient!.TranscribeAudioStreamingAsync(tempFile, CancellationToken.None);
-                            await foreach (var chunk in response)
-                            {
-                                if (!string.IsNullOrWhiteSpace(chunk.Text))
-                                {
-                                    gotText = true;
-                                    SafeUI(() => CommitText(chunk.Text));
-                                }
-                            }
-                            if (!gotText)
-                                SafeUI(() => AppendSystemLine("[No speech detected]"));
-                        }
-                        catch (Exception ex)
-                        {
-                            File.AppendAllText(Program.LogFile,
-                                $"[{DateTime.Now:HH:mm:ss}] Transcription error: {ex}\n");
-                            SafeUI(() => AppendSystemLine($"[Transcription error: {ex.Message}]"));
-                        }
-                        finally
-                        {
-                            try { File.Delete(tempFile); } catch { }
-                        }
+                        var p = _whisperTempFile;
+                        try { _whisperWriter.Dispose(); } catch { }
+                        _whisperWriter   = null;
+                        _whisperTempFile = null;
+                        if (!string.IsNullOrEmpty(p)) try { File.Delete(p); } catch { }
                     }
                 }
-                catch (Exception ex)
+                _whisperChunkAccum = 0;
+
+                // Signal end of queue and wait for all chunks to be transcribed
+                if (_whisperChunkQueue != null)
                 {
-                    SafeUI(() => AppendSystemLine($"[Error finalizing recording: {ex.Message}]"));
+                    _whisperChunkQueue.Writer.TryComplete();
+                    _whisperChunkQueue = null;
+                }
+                if (_whisperChunkTask != null)
+                {
+                    Status("⏳  Finishing transcription…");
+                    try { await _whisperChunkTask; } catch { }
+                    _whisperChunkTask = null;
                 }
             }
 
             Status("✅  Done");
-        }
-
-        // ── Windows Speech Recognition ────────────────────────────────────────────
-
-        private void StartWindowsStt()
-        {
-            try
-            {
-                _sre?.Dispose();
-                _sre = new SpeechRecognitionEngine(new System.Globalization.CultureInfo("en-US"));
-                _sre.LoadGrammar(new DictationGrammar());
-
-                // Near-realtime: show hypothesis (gray) as user speaks
-                _sre.SpeechHypothesized        += (s, e) => SafeUI(() => ShowInterim(e.Result.Text));
-                _sre.SpeechRecognized          += (s, e) => SafeUI(() => CommitText(e.Result.Text + " "));
-                _sre.SpeechRecognitionRejected += (s, e) => SafeUI(ClearInterim);
-
-                _sre.SetInputToDefaultAudioDevice();
-                _sre.RecognizeAsync(RecognizeMode.Multiple);
-            }
-            catch (Exception ex)
-            {
-                SafeUI(() =>
-                {
-                    Status($"❌  Windows STT error: {ex.Message}");
-                    _isRecording         = false;
-                    _btnRecord.Text      = "🎤  Start Recording";
-                    _btnRecord.BackColor = Teal;
-                });
-            }
         }
 
         // ── Foundry — SDK-native transcription (no HTTP) ─────────────────────────
@@ -647,14 +647,49 @@ namespace FoundrySTT
 
             if (IsWhisperModel)
             {
-                // Whisper does not support live streaming; buffer audio and transcribe on stop.
+                // Whisper: record in 4-second chunks and transcribe each chunk in real-time.
                 try
                 {
-                    _whisperTempFile = Path.Combine(
-                        Path.GetTempPath(), $"foundry_stt_{Guid.NewGuid():N}.wav");
+                    var waveFormat = new WaveFormat(WavSampleRate, 16, 1);
 
-                    var waveFormat = new WaveFormat(16000, 16, 1);
-                    _whisperWriter = new WaveFileWriter(_whisperTempFile, waveFormat);
+                    // Start first chunk file
+                    _whisperTempFile      = Path.Combine(Path.GetTempPath(), $"foundry_stt_{Guid.NewGuid():N}.wav");
+                    _whisperWriter        = new WaveFileWriter(_whisperTempFile, waveFormat);
+                    _whisperChunkAccum    = 0;
+
+                    // Channel-based queue: DataAvailable puts completed chunk file paths here;
+                    // a consumer task transcribes them one by one.
+                    _whisperChunkQueue = Channel.CreateBounded<string>(
+                        new BoundedChannelOptions(20) { FullMode = BoundedChannelFullMode.Wait });
+
+                    var capturedClient = _audioClient!;
+                    _whisperChunkTask = Task.Run(async () =>
+                    {
+                        await foreach (var filePath in _whisperChunkQueue!.Reader.ReadAllAsync())
+                        {
+                            try
+                            {
+                                bool gotAny = false;
+                                await foreach (var seg in capturedClient.TranscribeAudioStreamingAsync(filePath, CancellationToken.None))
+                                {
+                                    if (!string.IsNullOrWhiteSpace(seg.Text))
+                                    {
+                                        gotAny = true;
+                                        SafeUI(() => CommitText(seg.Text));
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                File.AppendAllText(Program.LogFile,
+                                    $"[{DateTime.Now:HH:mm:ss}] Chunk transcription error: {ex.Message}\n");
+                            }
+                            finally
+                            {
+                                try { File.Delete(filePath); } catch { }
+                            }
+                        }
+                    });
 
                     _waveIn = new WaveInEvent
                     {
@@ -664,11 +699,28 @@ namespace FoundrySTT
                     };
                     _waveIn.DataAvailable += (s, e) =>
                     {
-                        if (_isRecording && e.BytesRecorded > 0)
-                            _whisperWriter?.Write(e.Buffer, 0, e.BytesRecorded);
+                        if (!_isRecording || e.BytesRecorded == 0 || _whisperWriter == null) return;
+
+                        _whisperWriter.Write(e.Buffer, 0, e.BytesRecorded);
+                        _whisperChunkAccum += e.BytesRecorded;
+
+                        // When chunk is full (4 seconds), flush it, queue for transcription, start a new chunk
+                        if (_whisperChunkAccum >= ChunkBytes)
+                        {
+                            var finishedPath = _whisperTempFile!;
+                            _whisperWriter.Flush();
+                            _whisperWriter.Dispose();
+                            _whisperWriter = null;
+
+                            _whisperChunkQueue?.Writer.TryWrite(finishedPath);
+
+                            _whisperTempFile   = Path.Combine(Path.GetTempPath(), $"foundry_stt_{Guid.NewGuid():N}.wav");
+                            _whisperWriter     = new WaveFileWriter(_whisperTempFile, new WaveFormat(WavSampleRate, 16, 1));
+                            _whisperChunkAccum = 0;
+                        }
                     };
                     _waveIn.StartRecording();
-                    SafeUI(() => AppendSystemLine("[Recording… press Stop to transcribe]"));
+                    SafeUI(() => AppendSystemLine("[Recording… transcribing in real-time every ~4 seconds]"));
                 }
                 catch (Exception ex)
                 {
@@ -819,15 +871,57 @@ namespace FoundrySTT
         {
             _isRecording = false;
             _liveCts?.Cancel();
-            try { _sre?.RecognizeAsyncStop(); } catch { }
             try { _waveIn?.StopRecording(); } catch { }
             try { _liveSession?.StopAsync().GetAwaiter().GetResult(); } catch { }
             try { _whisperWriter?.Dispose(); } catch { }
             try { if (!string.IsNullOrEmpty(_whisperTempFile)) File.Delete(_whisperTempFile); } catch { }
-            _sre?.Dispose();
+            try { _whisperChunkQueue?.Writer.TryComplete(); } catch { }
+            try
+            {
+                if (_whisperChunkTask != null)
+                    _whisperChunkTask.GetAwaiter().GetResult();
+            }
+            catch { }
+            _whisperWriter = null;
+            _whisperTempFile = null;
+            _whisperChunkAccum = 0;
+            _whisperChunkQueue = null;
+            _whisperChunkTask = null;
             _waveIn?.Dispose();
             if (FoundryLocalManager.IsInitialized)
                 try { FoundryLocalManager.Instance.Dispose(); } catch { }
+        }
+
+        private void OnClearCacheClick(object? sender, EventArgs e)
+        {
+            string cachePath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".FoundrySTT", "cache", "models");
+            if (!Directory.Exists(cachePath))
+            {
+                MessageBox.Show("Model cache directory does not exist.", "Clear Cache",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            var result = MessageBox.Show(
+                $"Delete all cached models from:\n{cachePath}\n\nThis will require re-downloading models.",
+                "Clear Model Cache", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (result != DialogResult.Yes) return;
+            try
+            {
+                foreach (var d in new DirectoryInfo(cachePath).GetDirectories())
+                    d.Delete(true);
+                foreach (var f in new DirectoryInfo(cachePath).GetFiles())
+                    f.Delete();
+                MessageBox.Show("Model cache cleared.", "Clear Cache",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                Task.Run(() => LoadHardwareInfo()); // refresh display
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error clearing cache: {ex.Message}", "Clear Cache",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         // ── UI helpers ────────────────────────────────────────────────────────────
